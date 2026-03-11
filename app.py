@@ -1,6 +1,7 @@
 import datetime as dt
 from pathlib import Path
 
+import altair as alt
 import fastf1
 import numpy as np
 import pandas as pd
@@ -227,8 +228,12 @@ def main():
         return
 
     st.subheader("Predicted Finishing Order")
+    pred_table = (
+        pred_df[["PredictedRank", "Driver", "Team"]]
+        .rename(columns={"PredictedRank": "P"})
+    )
     st.dataframe(
-        pred_df[["PredictedRank", "Driver", "Team"]],
+        pred_table,
         use_container_width=True,
         hide_index=True,
     )
@@ -258,9 +263,39 @@ def main():
         )
         merged["Error"] = merged["ActualPosition"] - merged["PredictedRank"]
 
-        st.subheader("Prediction vs Actual (Completed Race)")
-        st.dataframe(
-            merged[
+        st.subheader("Prediction vs Actual")
+
+        # Side‑by‑side: visual chart and detailed table
+        vis_col, table_col = st.columns([1.2, 1])
+
+        valid_for_chart = merged.dropna(subset=["ActualPosition"]).copy()
+        if not valid_for_chart.empty:
+            chart = (
+                alt.Chart(valid_for_chart)
+                .mark_circle(size=80, opacity=0.9)
+                .encode(
+                    x=alt.X("PredictedRank:Q", title="Predicted Position (1 = best)", scale=alt.Scale(reverse=False)),
+                    y=alt.Y("ActualPosition:Q", title="Actual Position (1 = best)", scale=alt.Scale(reverse=False)),
+                    color=alt.Color("Team:N", legend=None),
+                    tooltip=["Driver", "Team", "PredictedRank", "ActualPosition", "Error"],
+                )
+            )
+
+            # Diagonal reference line (perfect prediction)
+            max_pos = int(max(valid_for_chart["PredictedRank"].max(), valid_for_chart["ActualPosition"].max()))
+            diag_df = pd.DataFrame({"PredictedRank": list(range(1, max_pos + 1)), "ActualPosition": list(range(1, max_pos + 1))})
+            diag = (
+                alt.Chart(diag_df)
+                .mark_line(strokeDash=[4, 4], color="gray")
+                .encode(x="PredictedRank:Q", y="ActualPosition:Q")
+            )
+
+            with vis_col:
+                st.caption("Dots close to the diagonal line = better predictions.")
+                st.altair_chart((chart + diag).properties(height=350), use_container_width=True)
+
+        with table_col:
+            merged_table = merged[
                 [
                     "PredictedRank",
                     "Driver",
@@ -268,10 +303,41 @@ def main():
                     "ActualPosition",
                     "Error",
                 ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+            ].rename(
+                columns={
+                    "PredictedRank": "Pred",
+                    "ActualPosition": "Actual",
+                }
+            )
+            st.dataframe(
+                merged_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # Optional compact backtest metrics in an expander
+        valid = merged.dropna(subset=["ActualPosition"])
+        if not valid.empty:
+            with st.expander("Show backtest metrics for this race"):
+                mae = (valid["Error"].abs()).mean()
+
+                pred_top3 = set(valid.loc[valid["PredictedRank"] <= 3, "Driver"])
+                actual_top3 = set(valid.loc[valid["ActualPosition"] <= 3, "Driver"])
+                top3_overlap = len(pred_top3 & actual_top3)
+
+                winner_row = valid.loc[valid["ActualPosition"] == 1]
+                winner_in_top3 = False
+                if not winner_row.empty:
+                    winner_pred_rank = int(winner_row["PredictedRank"].min())
+                    winner_in_top3 = winner_pred_rank <= 3
+
+                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1.metric("Mean Abs Error", f"{mae:.2f}")
+                col_m2.metric("Top-3 Overlap", f"{top3_overlap}")
+                col_m3.metric(
+                    "Winner in Pred Top 3",
+                    "Yes" if winner_in_top3 else "No",
+                )
 
 
 if __name__ == "__main__":
