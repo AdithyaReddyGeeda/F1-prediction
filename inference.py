@@ -193,6 +193,16 @@ def predict_finishing_order(
     return (out, None) if return_debug else out
 
 
+def _circuit_abrasion_proxy(circuit: str) -> float:
+    """0=low, 0.5=med, 1=high. Matches utils.race_features."""
+    c = str(circuit).lower()
+    if any(x in c for x in ["bahrain", "abu dhabi", "barcelona", "spanish", "silverstone", "british", "suzuka", "japanese"]):
+        return 1.0
+    if any(x in c for x in ["monza", "italian", "spa", "belgian", "monaco", "miami", "hungaroring", "hungarian", "zandvoort", "dutch"]):
+        return 0.5
+    return 0.0
+
+
 def _circuit_type_dummies(circuit: str) -> tuple[float, float, float]:
     """Return (street, high_speed, technical) 0/1 dummies. Matches utils.race_features."""
     c = str(circuit).lower()
@@ -265,11 +275,18 @@ def _build_features(
             track_avg_driver = np.array([track_driver_map.get((a, circuit), default_track) for a in abbrevs], dtype=float)
             track_avg_team = np.array([track_team_map.get((t, circuit), default_track) for t in teams], dtype=float)
             driver_team_synergy = np.array([synergy_map.get((a, t), default_synergy) for a, t in zip(abbrevs, teams)], dtype=float)
-            teammate_delta = np.zeros(n, dtype=float)  # not available at inference
+            teammate_delta = np.zeros(n, dtype=float)
             constructor_dnf_rate = np.zeros(n, dtype=float)
+            driver_dnf_rate = np.zeros(n, dtype=float)
+            circuit_abrasion_proxy = np.full(n, _circuit_abrasion_proxy(circuit))
+            tyre_life_penalty_proxy = np.full(n, 0.5)
+            driver_tyre_management_proxy = np.zeros(n, dtype=float)
             form_x_teammate_delta = np.zeros(n, dtype=float)
             momentum = np.zeros(n, dtype=float)
             driver_rain_delta = np.array([rain_delta_map.get(a, 0.0) for a in abbrevs], dtype=float)
+            fp1_delta = np.zeros(n, dtype=float)
+            fp2_delta = np.zeros(n, dtype=float)
+            fp3_delta = np.zeros(n, dtype=float)
             street, high, tech = _circuit_type_dummies(circuit)
             circuit_type_street = np.full(n, street)
             circuit_type_high_speed = np.full(n, high)
@@ -284,9 +301,16 @@ def _build_features(
                 driver_team_synergy,
                 teammate_delta,
                 constructor_dnf_rate,
+                driver_dnf_rate,
+                circuit_abrasion_proxy,
+                tyre_life_penalty_proxy,
+                driver_tyre_management_proxy,
                 form_x_teammate_delta,
                 momentum,
                 driver_rain_delta,
+                fp1_delta,
+                fp2_delta,
+                fp3_delta,
                 driver_enc,
                 team_enc,
                 circuit_enc,

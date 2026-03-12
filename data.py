@@ -45,6 +45,65 @@ def load_race_results(year: int, round_number: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_fp_deltas(year: int, round_number: int) -> pd.DataFrame:
+    """
+    Load FP1/FP2/FP3 best lap deltas to session fastest (seconds).
+    Returns DataFrame with Year, Round, Abbreviation, FP1_delta, FP2_delta, FP3_delta (NaN if no data).
+    """
+    out = []
+    for session_name in ("FP1", "FP2", "FP3"):
+        try:
+            session = fastf1.get_session(year, round_number, session_name)
+            session.load()
+            laps = session.laps
+            if laps is None or laps.empty:
+                continue
+            # Best lap per driver
+            best = laps.dropna(subset=["LapTime"]).groupby("DriverNumber").agg(
+                LapTime=("LapTime", "min")
+            ).reset_index()
+            if best.empty:
+                continue
+            # Fastest in session
+            fastest = best["LapTime"].min()
+            if fastest is None or pd.isna(fastest):
+                continue
+            # Delta in seconds (timedelta -> float)
+            def _to_sec(t):
+                if t is None or pd.isna(t):
+                    return 0.0
+                if hasattr(t, "total_seconds"):
+                    return t.total_seconds()
+                return float(t)
+            fastest_sec = _to_sec(fastest)
+            best["delta_sec"] = best["LapTime"].apply(lambda x: _to_sec(x) - fastest_sec)
+            drivers = session.results
+            if drivers is not None and not drivers.empty and "Abbreviation" in drivers.columns:
+                best = best.merge(
+                    drivers[["DriverNumber", "Abbreviation"]].drop_duplicates("DriverNumber"),
+                    on="DriverNumber",
+                    how="left",
+                )
+            else:
+                best["Abbreviation"] = best["DriverNumber"].astype(str)
+            best["Year"] = year
+            best["Round"] = round_number
+            best[session_name + "_delta"] = best["delta_sec"]
+            out.append(best[["Year", "Round", "Abbreviation", session_name + "_delta"]])
+        except Exception:
+            continue
+    if not out:
+        return pd.DataFrame()
+    merged = out[0]
+    for d in out[1:]:
+        merged = merged.merge(
+            d,
+            on=["Year", "Round", "Abbreviation"],
+            how="outer",
+        )
+    return merged
+
+
 def load_qualifying_results(year: int, round_number: int) -> pd.DataFrame:
     """Load qualifying results (positions 1–22) for a specific event. Empty DataFrame on failure."""
     try:

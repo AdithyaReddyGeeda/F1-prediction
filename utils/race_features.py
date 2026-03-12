@@ -255,6 +255,58 @@ def get_constructor_dnf_rate(
     return out.fillna(0.0)
 
 
+# Circuit abrasion proxy: high tyre degradation tracks (0=low, 0.5=med, 1=high)
+CIRCUIT_ABRASION = {
+    "high": ["Bahrain", "Abu Dhabi", "Barcelona", "Spanish", "Silverstone", "British", "Suzuka", "Japanese"],
+    "medium": ["Monza", "Italian", "Spa", "Belgian", "Monaco", "Miami", "Hungaroring", "Hungarian", "Zandvoort", "Dutch"],
+}
+def get_circuit_abrasion_proxy(circuit: str) -> float:
+    c = str(circuit).lower()
+    for level, keywords in CIRCUIT_ABRASION.items():
+        if any(kw.lower() in c for kw in keywords):
+            return 1.0 if level == "high" else 0.5
+    return 0.0
+
+
+def get_tyre_life_penalty_proxy(laps_fraction: float = 0.5, decay_laps: float = 30.0) -> float:
+    """Non-linear tyre life penalty: 1 - exp(-laps_fraction * 50 / decay_laps). Use default 0.5 if unknown."""
+    import math
+    x = laps_fraction * 50.0 / max(decay_laps, 1.0)
+    return 1.0 - math.exp(-min(x, 5.0))
+
+
+def get_driver_dnf_rate(
+    df: pd.DataFrame,
+    last_n: int = 10,
+    position_col: str = "Position",
+    status_col: Optional[str] = "Status",
+) -> pd.Series:
+    """Per-driver DNF rate in last N races (past only). Fraction 0–1."""
+    df = df.sort_values(["Year", "Round"])
+    is_dnf = pd.Series(0.0, index=df.index)
+    if status_col and status_col in df.columns:
+        dnf_flags = df[status_col].astype(str).str.upper().str.contains(
+            "ACCIDENT|COLLISION|DNF|RETIRED|WHEEL|ENGINE|GEARBOX|BRAKE|SUSPENSION|POWER|SPUN|DAMAGE",
+            na=False,
+            regex=True,
+        )
+        is_dnf = dnf_flags.astype(float)
+    pos = df[position_col].astype(float)
+    is_dnf = is_dnf.where(is_dnf == 1.0, ((pos > 20) | pos.isna()).astype(float))
+    out = pd.Series(index=df.index, dtype=float)
+    for driver in df["Abbreviation"].unique():
+        mask = df["Abbreviation"] == driver
+        sub = df.loc[mask].sort_values(["Year", "Round"])
+        for i, idx in enumerate(sub.index):
+            past = sub.iloc[:i]
+            if len(past) == 0:
+                out.loc[idx] = 0.0
+                continue
+            last = past.tail(last_n)
+            out.loc[idx] = is_dnf.loc[last.index].mean()
+    return out.fillna(0.0)
+
+
 def add_circuit_type_dummies(df: pd.DataFrame, circuit_col: str = "Circuit") -> pd.DataFrame:
     """Add circuit_type_street, circuit_type_high_speed, circuit_type_technical (0/1)."""
     df = df.copy()
@@ -269,6 +321,7 @@ def build_race_feature_df(
     race_df: pd.DataFrame,
     quali_df: Optional[pd.DataFrame] = None,
     weather_per_race: Optional[dict] = None,
+    fp_df: Optional[pd.DataFrame] = None,
     ewma_alpha: float = 0.4,
     default_avg_pos: float = DEFAULT_AVG_POS,
 ) -> pd.DataFrame:
@@ -312,6 +365,16 @@ def build_race_feature_df(
         df, last_n=10, position_col="Position", status_col="Status" if "Status" in df.columns else None
     ).values
 
+    # Driver DNF rate (past last_n races)
+    df["driver_dnf_rate"] = get_driver_dnf_rate(
+        df, last_n=10, position_col="Position", status_col="Status" if "Status" in df.columns else None
+    ).values
+
+    # Tyre degradation proxies: circuit abrasion, tyre life penalty (default 0.5), driver tyre management placeholder
+    df["circuit_abrasion_proxy"] = df["Circuit"].map(get_circuit_abrasion_proxy).values
+    df["tyre_life_penalty_proxy"] = get_tyre_life_penalty_proxy(0.5)
+    df["driver_tyre_management_proxy"] = 0.0  # placeholder; can be filled from stint data later
+
     # Interaction: form * teammate_delta (captures under/overperformance vs teammate)
     df["form_x_teammate_delta"] = (df["RecentForm"].astype(float) * df["teammate_delta"].astype(float)).values
 
@@ -350,6 +413,26 @@ def build_race_feature_df(
         df["QualiPosition"] = df["QualiPosition"].fillna(df["GridPosition"])
     else:
         df["QualiPosition"] = df["GridPosition"].values
+
+    # Practice session deltas (merge when available)
+    if fp_df is not None and not fp_df.empty:
+        fp_cols = [c for c in ["FP1_delta", "FP2_delta", "FP3_delta"] if c in fp_df.columns]
+        if fp_cols:
+            df = df.merge(
+                fp_df[["Year", "Round", "Abbreviation"] + fp_cols].drop_duplicates(
+                    subset=["Year", "Round", "Abbreviation"], keep="last"
+                ),
+                on=["Year", "Round", "Abbreviation"],
+                how="left",
+            )
+            for c in fp_cols:
+                if c not in df.columns:
+                    df[c] = 0.0
+                else:
+                    df[c] = df[c].fillna(0.0)
+    for c in ["FP1_delta", "FP2_delta", "FP3_delta"]:
+        if c not in df.columns:
+            df[c] = 0.0
 
     # Interaction and rain flag
     df["is_rain"] = (df["Weather"] == "Rain").astype(float)

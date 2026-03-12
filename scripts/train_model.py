@@ -85,6 +85,35 @@ def load_historical_quali_for_merge(start_year: int = 2020, end_year: int = 2025
     return pd.concat(rows, ignore_index=True)
 
 
+def load_historical_fp_deltas(start_year: int = 2020, end_year: int = 2025) -> pd.DataFrame:
+    """Load FP1/FP2/FP3 deltas for all races. Returns merged DataFrame with Year, Round, Abbreviation, FP1_delta, FP2_delta, FP3_delta."""
+    from data import get_event_schedule, load_fp_deltas
+    import fastf1
+    cache_dir = ROOT / "fastf1_cache"
+    cache_dir.mkdir(exist_ok=True)
+    fastf1.Cache.enable_cache(cache_dir)
+    rows = []
+    for year in range(start_year, end_year + 1):
+        try:
+            sched = get_event_schedule(year)
+            if sched.empty:
+                continue
+            for _, row in sched.iterrows():
+                r = int(row["RoundNumber"])
+                try:
+                    fp = load_fp_deltas(year, r)
+                    if fp.empty:
+                        continue
+                    rows.append(fp)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
 def oversample_wet_rain(df: pd.DataFrame, target_min_pct: float = 0.25, rng=None) -> pd.DataFrame:
     """Oversample Wet and Rain rows so model sees enough weather signal. Aggressive if <10%."""
     if rng is None:
@@ -137,19 +166,106 @@ def main():
     if quali_df.empty:
         quali_df = None
 
-    print("Building race features (EWMA, track-specific, synergy, momentum, weather)...")
-    # Weather per race (one per Year, Round) for no-leakage driver_rain_delta
+    print("Loading FP deltas (FP1/FP2/FP3) for practice signals...")
+    fp_df = load_historical_fp_deltas(2020, 2025)
+    if fp_df.empty:
+        fp_df = None
+
     rng = np.random.default_rng(42)
     keys = race_df[["Year", "Round"]].drop_duplicates()
     w = rng.random(len(keys))
     weather_per_race = dict(
         zip(zip(keys["Year"], keys["Round"]), np.where(w < 0.50, "Dry", np.where(w < 0.80, "Wet", "Rain")))
     )
+
+    # EWMA alpha grid search (0.3–0.6): pick best alpha by validation MAE with a quick model
+    print("EWMA alpha grid search (0.3, 0.4, 0.5, 0.6)...")
+    best_alpha, best_alpha_mae = 0.4, np.inf
+    for alpha in [0.3, 0.4, 0.5, 0.6]:
+        X_alpha = build_race_feature_df(
+            race_df,
+            quali_df=quali_df,
+            weather_per_race=weather_per_race,
+            fp_df=fp_df,
+            ewma_alpha=alpha,
+        )
+        X_alpha = oversample_wet_rain(X_alpha, target_min_pct=0.25, rng=rng)
+        if len(X_alpha) < 100:
+            continue
+        # Quick encode (reuse logic below but minimal)
+        from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+        enc_d = LabelEncoder()
+        enc_t = LabelEncoder()
+        enc_c = LabelEncoder()
+        enc_w = OneHotEncoder(categories=[WEATHER_CATEGORIES], drop=None, sparse_output=False)
+        grid_2026 = pd.DataFrame(GRID_2026)
+        enc_d.fit(list(X_alpha["Abbreviation"].unique()) + list(grid_2026["Abbreviation"].unique()))
+        enc_t.fit(list(X_alpha["TeamName"].unique()) + list(grid_2026["TeamName"].unique()))
+        enc_c.fit(list(X_alpha["Circuit"].unique()) + ["Australian Grand Prix"])
+        enc_w.fit(np.array(WEATHER_CATEGORIES).reshape(-1, 1))
+        for c in ["driver_enc", "team_enc", "circuit_enc", "weather_Dry", "weather_Wet", "weather_Rain",
+                  "FP1_delta", "FP2_delta", "FP3_delta", "circuit_abrasion_proxy", "tyre_life_penalty_proxy",
+                  "driver_dnf_rate", "driver_tyre_management_proxy"]:
+            if c not in X_alpha.columns and "enc" in c:
+                continue
+            if c == "driver_enc":
+                X_alpha["driver_enc"] = enc_d.transform(X_alpha["Abbreviation"].astype(str))
+            elif c == "team_enc":
+                X_alpha["team_enc"] = enc_t.transform(X_alpha["TeamName"].astype(str))
+            elif c == "circuit_enc":
+                X_alpha["circuit_enc"] = enc_c.transform(X_alpha["Circuit"].astype(str))
+            elif c == "weather_Dry":
+                wo = enc_w.transform(X_alpha[["Weather"]].values)
+                X_alpha["weather_Dry"], X_alpha["weather_Wet"], X_alpha["weather_Rain"] = wo[:, 0], wo[:, 1], wo[:, 2]
+        feat_cols_alpha = [
+            "GridPosition", "QualiPosition", "RecentForm", "ConstructorEwma",
+            "track_avg_driver", "track_avg_team", "driver_team_synergy", "teammate_delta", "constructor_dnf_rate",
+            "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
+            "form_x_teammate_delta", "momentum", "driver_rain_delta",
+            "FP1_delta", "FP2_delta", "FP3_delta",
+            "driver_enc", "team_enc", "circuit_enc",
+            "circuit_type_street", "circuit_type_high_speed", "circuit_type_technical",
+            "weather_Dry", "weather_Wet", "weather_Rain", "grid_pos_x_rain",
+        ]
+        for c in feat_cols_alpha:
+            if c not in X_alpha.columns:
+                X_alpha[c] = 0.0 if "enc" in c or "weather" in c or "circuit_type" in c else (10.0 if "track" in c or "synergy" in c or "Constructor" in c or "Quali" in c or "Grid" in c else 0.0)
+        X_mat = X_alpha[feat_cols_alpha].values
+        train_m = (X_alpha["Year"] >= 2020) & (X_alpha["Year"] <= 2023)
+        val_m = X_alpha["Year"] == 2024
+        if val_m.sum() == 0:
+            val_m = X_alpha["Year"] == 2025
+        if val_m.sum() == 0:
+            continue
+        from sklearn.preprocessing import StandardScaler
+        scale_idx_a = [i for i, n in enumerate(feat_cols_alpha) if n not in ("driver_enc", "team_enc", "circuit_enc") and not n.startswith("weather_") and not n.startswith("circuit_type_")]
+        scaler_a = StandardScaler()
+        X_t = X_mat[train_m].copy()
+        X_v = X_mat[val_m].copy()
+        X_t[:, scale_idx_a] = scaler_a.fit_transform(X_t[:, scale_idx_a])
+        X_v[:, scale_idx_a] = scaler_a.transform(X_v[:, scale_idx_a])
+        y_t = X_alpha.loc[train_m, "Position"].astype(float)
+        y_v = X_alpha.loc[val_m, "Position"].astype(float)
+        try:
+            import xgboost as xgb
+            m = xgb.XGBRegressor(objective="reg:absoluteerror", n_estimators=80, max_depth=5, random_state=42)
+            m.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
+            p = np.clip(m.predict(X_v), 1, 22)
+            mae_a = np.abs(p - y_v.values).mean()
+            if mae_a < best_alpha_mae:
+                best_alpha_mae = mae_a
+                best_alpha = alpha
+        except Exception:
+            pass
+    print("Best EWMA alpha: {:.1f} (val MAE: {:.3f})".format(best_alpha, best_alpha_mae))
+
+    print("Building race features (EWMA alpha={}, track, synergy, tyre, practice)...".format(best_alpha))
     X_df = build_race_feature_df(
         race_df,
         quali_df=quali_df,
         weather_per_race=weather_per_race,
-        ewma_alpha=0.4,
+        fp_df=fp_df,
+        ewma_alpha=best_alpha,
     )
     X_df = oversample_wet_rain(X_df, target_min_pct=0.25, rng=rng)
     y = X_df["Position"].astype(float)
@@ -176,11 +292,13 @@ def main():
     X_df["weather_Wet"] = wo[:, 1]
     X_df["weather_Rain"] = wo[:, 2]
 
-    # Feature columns (order must match inference); include new: teammate_delta, constructor_dnf_rate, form_x_teammate_delta
+    # Feature columns (order must match inference); include tyre, driver_dnf, practice deltas
     feat_cols = [
         "GridPosition", "QualiPosition", "RecentForm", "ConstructorEwma",
         "track_avg_driver", "track_avg_team", "driver_team_synergy", "teammate_delta", "constructor_dnf_rate",
+        "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
         "form_x_teammate_delta", "momentum", "driver_rain_delta",
+        "FP1_delta", "FP2_delta", "FP3_delta",
         "driver_enc", "team_enc", "circuit_enc",
         "circuit_type_street", "circuit_type_high_speed", "circuit_type_technical",
         "weather_Dry", "weather_Wet", "weather_Rain", "grid_pos_x_rain",
@@ -278,16 +396,17 @@ def main():
 
     pred_val = model.predict(X_val_scaled)
     pred_val = np.clip(pred_val, 1, 22)
-    # Post-process: blend with quali (0.65 race + 0.35 quali), then enforce ranks per race
+    mae_before_blend = np.abs(pred_val - y_val.values).mean()
+    # Post-process: blend 0.7 race + 0.3 quali, then enforce per-race ranks (argsort → 1–22)
     quali_col = feat_cols.index("QualiPosition")
     quali_vals = X_val[:, quali_col]
-    pred_blend = 0.65 * pred_val + 0.35 * quali_vals
+    pred_blend = 0.7 * pred_val + 0.3 * quali_vals
     pred_blend = np.clip(pred_blend, 1, 22)
-    # Per-race rank sort: assign 1..N by sorted order within each (Year, Round)
     val_df["_pred_raw"] = pred_blend
     val_df["_rank"] = val_df.groupby(["Year", "Round"])["_pred_raw"].rank(method="first", ascending=True)
     pred_val = val_df["_rank"].values.astype(float)
     mae_val = np.abs(pred_val - y_val.values).mean()
+    print("MAE before blend: {:.3f}  |  after blend + rank: {:.3f}".format(mae_before_blend, mae_val))
 
     rmse_val = np.sqrt(((pred_val - y_val.values) ** 2).mean())
     ss_res = ((y_val.values - pred_val) ** 2).sum()
@@ -322,6 +441,32 @@ def main():
     worst = val_df.nlargest(10, "error")[["Year", "Round", "Abbreviation", "actual", "pred", "error"]]
     print("Largest 10 errors (midfield/DNF etc):")
     print(worst.to_string(index=False))
+
+    # Stratified MAE: top-5 vs midfield vs back, dry vs wet
+    top5 = val_df[val_df["actual"] <= 5]
+    midfield = val_df[(val_df["actual"] >= 6) & (val_df["actual"] <= 15)]
+    back = val_df[val_df["actual"] >= 16]
+    dry_races = val_df[val_df["Weather"] == "Dry"]
+    wet_races = val_df[val_df["Weather"].isin(["Wet", "Rain"])]
+    print("Stratified MAE:")
+    if len(top5) > 0:
+        print("  Top-5 (actual 1–5): {:.3f}".format(top5["error"].mean()))
+    if len(midfield) > 0:
+        print("  Midfield (6–15): {:.3f}".format(midfield["error"].mean()))
+    if len(back) > 0:
+        print("  Back (16–22): {:.3f}".format(back["error"].mean()))
+    if len(dry_races) > 0:
+        print("  Dry races: {:.3f}".format(dry_races["error"].mean()))
+    if len(wet_races) > 0:
+        print("  Wet/rain races: {:.3f}".format(wet_races["error"].mean()))
+
+    # Sample pred vs actual for recent 2025/2026 races
+    recent_val = val_df[val_df["Year"].isin([2025, 2026])]
+    if not recent_val.empty:
+        print("Sample pred vs actual (2025/2026 races):")
+        for (yr, rnd), g in recent_val.groupby(["Year", "Round"]):
+            print("  {} R{}".format(int(yr), int(rnd)))
+            print(g[["Abbreviation", "actual", "pred", "error"]].head(8).to_string(index=False))
 
     # Diagnostics: feature importance barh, error histogram, per-race MAE (save to artifacts)
     out_dir = ROOT / "model_artifacts"
