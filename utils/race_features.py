@@ -198,6 +198,63 @@ def get_driver_rain_delta(
     return out
 
 
+def get_relative_teammate_delta(df: pd.DataFrame, form_col: str = "RecentForm") -> pd.Series:
+    """
+    Per-row: driver's form minus teammate's form (same team, same race).
+    Positive = this driver has been finishing worse than teammate. Uses form_col (e.g. RecentForm).
+    """
+    out = pd.Series(index=df.index, dtype=float)
+    df = df.sort_values(["Year", "Round"])
+    for (yr, rnd, team), g in df.groupby(["Year", "Round", "TeamName"]):
+        if len(g) < 2:
+            out.loc[g.index] = 0.0
+            continue
+        drivers = g["Abbreviation"].tolist()
+        forms = g[form_col].values
+        for i, idx in enumerate(g.index):
+            # Teammate = other driver(s) in same race/team; use mean form of others
+            other_forms = [forms[j] for j in range(len(forms)) if j != i]
+            teammate_form = np.mean(other_forms) if other_forms else forms[i]
+            out.loc[idx] = forms[i] - teammate_form
+    return out.fillna(0.0)
+
+
+def get_constructor_dnf_rate(
+    df: pd.DataFrame,
+    last_n: int = 10,
+    position_col: str = "Position",
+    status_col: Optional[str] = "Status",
+) -> pd.Series:
+    """
+    Per-row: constructor's DNF rate in last N race entries (past only).
+    DNF = Status indicates DNF, or Position > 20 / null. Returns fraction 0–1.
+    """
+    df = df.sort_values(["Year", "Round"])
+    is_dnf = pd.Series(0.0, index=df.index)
+    if status_col and status_col in df.columns:
+        dnf_flags = df[status_col].astype(str).str.upper().str.contains(
+            "ACCIDENT|COLLISION|DNF|RETIRED|WHEEL|ENGINE|GEARBOX|BRAKE|SUSPENSION|POWER|SPUN|DAMAGE",
+            na=False,
+            regex=True,
+        )
+        is_dnf = dnf_flags.astype(float)
+    pos = df[position_col].astype(float)
+    is_dnf = is_dnf.where(is_dnf == 1.0, ((pos > 20) | pos.isna()).astype(float))
+    out = pd.Series(index=df.index, dtype=float)
+    for team in df["TeamName"].unique():
+        mask = df["TeamName"] == team
+        sub = df.loc[mask].sort_values(["Year", "Round"])
+        for i, (idx, row) in enumerate(sub.iterrows()):
+            past = sub.iloc[:i]
+            if len(past) == 0:
+                out.loc[idx] = 0.0
+                continue
+            last = past.tail(last_n)
+            rate = is_dnf.loc[last.index].mean()
+            out.loc[idx] = rate
+    return out.fillna(0.0)
+
+
 def add_circuit_type_dummies(df: pd.DataFrame, circuit_col: str = "Circuit") -> pd.DataFrame:
     """Add circuit_type_street, circuit_type_high_speed, circuit_type_technical (0/1)."""
     df = df.copy()
@@ -246,6 +303,17 @@ def build_race_feature_df(
 
     # Driver-team synergy
     df["driver_team_synergy"] = get_driver_team_synergy(df, position_col="Position").values
+
+    # Relative teammate: driver form minus teammate form (same race/team)
+    df["teammate_delta"] = get_relative_teammate_delta(df, form_col="RecentForm").values
+
+    # Constructor DNF rate (past last_n races)
+    df["constructor_dnf_rate"] = get_constructor_dnf_rate(
+        df, last_n=10, position_col="Position", status_col="Status" if "Status" in df.columns else None
+    ).values
+
+    # Interaction: form * teammate_delta (captures under/overperformance vs teammate)
+    df["form_x_teammate_delta"] = (df["RecentForm"].astype(float) * df["teammate_delta"].astype(float)).values
 
     # Momentum (position change)
     df["momentum"] = get_momentum_position_change(df, position_col="Position").values

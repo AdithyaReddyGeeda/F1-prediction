@@ -252,7 +252,7 @@ def _build_features(
         circuit_enc = _safe_transform(enc_circuit, [circuit] * n)
         recent_form = np.array([form.get(a, ROOKIE_AVG_POS) for a in abbrevs], dtype=float)
 
-        # Full feature set (new training pipeline)
+        # Full feature set (new training pipeline with teammate_delta, constructor_dnf_rate, form_x_teammate_delta)
         if encoders.get("track_avg_driver_map") is not None and "QualiPosition" in (feature_names or []):
             default_track = encoders.get("DEFAULT_TRACK_AVG", 10.0)
             default_synergy = encoders.get("DEFAULT_SYNERGY", 10.0)
@@ -260,11 +260,14 @@ def _build_features(
             track_team_map = encoders.get("track_avg_team_map") or {}
             synergy_map = encoders.get("driver_team_synergy_map") or {}
             rain_delta_map = encoders.get("driver_rain_delta_map") or {}
-            quali_pos = grid_pos  # use grid as quali proxy at inference
-            constructor_ewma = recent_form  # proxy with driver form
+            quali_pos = grid_pos
+            constructor_ewma = recent_form
             track_avg_driver = np.array([track_driver_map.get((a, circuit), default_track) for a in abbrevs], dtype=float)
             track_avg_team = np.array([track_team_map.get((t, circuit), default_track) for t in teams], dtype=float)
             driver_team_synergy = np.array([synergy_map.get((a, t), default_synergy) for a, t in zip(abbrevs, teams)], dtype=float)
+            teammate_delta = np.zeros(n, dtype=float)  # not available at inference
+            constructor_dnf_rate = np.zeros(n, dtype=float)
+            form_x_teammate_delta = np.zeros(n, dtype=float)
             momentum = np.zeros(n, dtype=float)
             driver_rain_delta = np.array([rain_delta_map.get(a, 0.0) for a in abbrevs], dtype=float)
             street, high, tech = _circuit_type_dummies(circuit)
@@ -279,6 +282,9 @@ def _build_features(
                 track_avg_driver,
                 track_avg_team,
                 driver_team_synergy,
+                teammate_delta,
+                constructor_dnf_rate,
+                form_x_teammate_delta,
                 momentum,
                 driver_rain_delta,
                 driver_enc,
@@ -292,6 +298,11 @@ def _build_features(
                 weather_onehot[:, 2],
                 grid_pos_x_rain,
             ])
+            scaler = encoders.get("scaler")
+            scale_idx = encoders.get("scale_idx")
+            if scaler is not None and scale_idx is not None:
+                X = X.astype(float)
+                X[:, scale_idx] = scaler.transform(X[:, scale_idx])
         else:
             # Legacy 9-feature matrix
             X = np.column_stack([
