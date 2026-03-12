@@ -1,345 +1,286 @@
+"""
+F1 Race Prediction Dashboard — Streamlit.
+Qualifying prediction (1–22) feeds into race prediction. 2025 fallback automatic when no 2026 data.
+"""
+from __future__ import annotations
+
 import datetime as dt
 from pathlib import Path
 
 import altair as alt
-import fastf1
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+ROOT = Path(__file__).resolve().parent
+import sys
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-def enable_fastf1_cache():
-    cache_dir = Path("./fastf1_cache")
-    cache_dir.mkdir(exist_ok=True)
-    fastf1.Cache.enable_cache(cache_dir)
-
-
-@st.cache_data(show_spinner=False)
-def get_event_schedule(year: int) -> pd.DataFrame:
-    schedule = fastf1.get_event_schedule(year, include_testing=False)
-    # Ensure we have a clean, small set of columns for the UI
-    df = schedule[["RoundNumber", "EventName", "EventDate", "Country"]].copy()
-    df["EventDate"] = pd.to_datetime(df["EventDate"]).dt.date
-    return df
+from config import GRID_2026
+from inference import predict_finishing_order
+from quali_inference import predict_quali_order
+from data import enable_fastf1_cache, get_event_schedule, load_race_results
+from utils.data_fetch import safe_get_drivers, safe_get_schedule
 
 
-@st.cache_data(show_spinner=True)
-def load_race_results(year: int, round_number: int) -> pd.DataFrame:
-    session = fastf1.get_session(year, round_number, "R")
-    session.load()  # uses cache after first run
-    results = session.results
-    # Convert to DataFrame with the fields we need
-    df = results[["DriverNumber", "Abbreviation", "TeamName", "Position"]].copy()
-    df["Position"] = pd.to_numeric(df["Position"], errors="coerce")
-    return df
+def init_session_state():
+    if "drivers_df" not in st.session_state:
+        st.session_state.drivers_df = pd.DataFrame()
+    if "schedule_df" not in st.session_state:
+        st.session_state.schedule_df = pd.DataFrame()
+    if "year" not in st.session_state:
+        st.session_state.year = 2026
+    if "predicted_quali_grid" not in st.session_state:
+        st.session_state.predicted_quali_grid = None  # DataFrame with PredictedQualiPos, Driver, Team, DriverName, Abbreviation, TeamName, GridPosition
 
 
-def build_prediction_for_event(
-    year: int,
-    round_number: int,
-    history_races: int,
-    seasons_back: int = 2,
-) -> pd.DataFrame:
-    """
-    Build predictions using up to `history_races` most recent completed races,
-    going backwards from the selected race across this season and previous ones.
-    Only the current grid (from the most recent race in that window) is included,
-    so you should see each active driver once.
-    """
-    history_frames: list[tuple[int, int, pd.DataFrame]] = []
-    races_collected = 0
+def quali_to_grid_df(quali_df: pd.DataFrame, drivers_df: pd.DataFrame) -> pd.DataFrame:
+    """Build grid DataFrame from quali result for race model: DriverName, Abbreviation, TeamName, GridPosition."""
+    grid_list = []
+    for _, row in quali_df.iterrows():
+        driver_name = row.get("Driver", row.get("DriverName", ""))
+        match = drivers_df[drivers_df["DriverName"].astype(str) == driver_name]
+        if match.empty and "Driver" in drivers_df.columns:
+            match = drivers_df[drivers_df["Driver"].astype(str) == driver_name]
+        if not match.empty:
+            r = match.iloc[0]
+            grid_list.append({
+                "DriverName": r["DriverName"],
+                "Abbreviation": r.get("Abbreviation", str(driver_name)[:3]),
+                "TeamName": r["TeamName"],
+                "GridPosition": int(row.get("PredictedQualiPos", 10)),
+            })
+    if not grid_list:
+        return pd.DataFrame()
+    out = pd.DataFrame(grid_list)
+    out["PredictedQualiPos"] = out["GridPosition"]
+    out["Driver"] = out["DriverName"]
+    out["Team"] = out["TeamName"]
+    return out
 
-    # Walk backwards over seasons and rounds until we have enough races
-    for y in range(year, max(year - seasons_back, 2014) - 1, -1):
-        # Figure out which rounds in this season to consider (backwards)
-        if y == year:
-            start_round = round_number - 1
-            if start_round < 1:
-                continue
-            candidate_rounds = range(start_round, 0, -1)
-        else:
-            sched = get_event_schedule(y)
-            if sched.empty:
-                continue
-            max_round = int(sched["RoundNumber"].max())
-            candidate_rounds = range(max_round, 0, -1)
 
-        for r in candidate_rounds:
-            if races_collected >= history_races:
-                break
-            try:
-                df_r = load_race_results(y, r)
-                if df_r.empty:
-                    continue
-                df_r["Round"] = r
-                df_r["Year"] = y
-                history_frames.append((y, r, df_r))
-                races_collected += 1
-            except Exception:
-                # If a particular session fails to load, skip it
-                continue
-
-        if races_collected >= history_races:
-            break
-
-    if not history_frames:
-        return pd.DataFrame(columns=["Driver", "Team", "AvgFinish", "RacesUsed"])
-
-    # Combine all races into one table
-    history = pd.concat([df for _, _, df in history_frames], ignore_index=True)
-    history = history.dropna(subset=["Position"])
-
-    if history.empty:
-        return pd.DataFrame(columns=["Driver", "Team", "AvgFinish", "RacesUsed"])
-
-    # Restrict to the current grid: take drivers from the most recent race in our window
-    latest_year, latest_round = max((y, r) for (y, r, _) in history_frames)
-    latest_df = next(df for (y, r, df) in history_frames if y == latest_year and r == latest_round)
-    current_grid = set(latest_df["Abbreviation"].dropna().unique())
-
-    history = history[history["Abbreviation"].isin(current_grid)]
-
-    if history.empty:
-        return pd.DataFrame(columns=["Driver", "Team", "AvgFinish", "RacesUsed"])
-
-    # Get latest metadata (team and number) per driver from the most recent race where they appeared
-    history_sorted = history.sort_values(["Year", "Round"])
-    latest_meta = (
-        history_sorted.groupby("Abbreviation")[["DriverNumber", "TeamName"]]
-        .last()
-        .reset_index()
-    )
-
-    # Aggregate performance stats per driver
-    stats = (
-        history.groupby("Abbreviation")
-        .agg(
-            AvgFinish=("Position", "mean"),
-            RacesUsed=("Position", "count"),
-        )
-        .reset_index()
-    )
-
-    summary = stats.merge(latest_meta, on="Abbreviation", how="left")
-    summary = summary.sort_values("AvgFinish", ascending=True).reset_index(drop=True)
-    summary.insert(0, "PredictedRank", np.arange(1, len(summary) + 1))
-    summary.rename(
-        columns={"Abbreviation": "Driver", "TeamName": "Team"},
-        inplace=True,
-    )
-    return summary
+def load_drivers_and_schedule(year: int):
+    used_2025_fallback = False
+    with st.spinner("Loading drivers and schedule..."):
+        drivers = safe_get_drivers(year, use_fallback_year=False)
+        schedule = safe_get_schedule(year, use_fallback_year=False)
+        if year >= 2026 and (drivers.empty or schedule.empty or len(drivers) < 22):
+            used_2025_fallback = True
+            drivers = safe_get_drivers(year, use_fallback_year=True)
+            schedule = safe_get_schedule(year, use_fallback_year=True)
+        if drivers.empty and year >= 2026:
+            drivers = pd.DataFrame(GRID_2026)
+        if schedule.empty and year == 2026:
+            schedule = pd.DataFrame([
+                {"RoundNumber": 1, "EventName": "Australian Grand Prix", "EventDate": dt.date(2026, 3, 8), "Country": "Australia"},
+                {"RoundNumber": 2, "EventName": "Chinese Grand Prix", "EventDate": dt.date(2026, 4, 19), "Country": "China"},
+                {"RoundNumber": 3, "EventName": "Miami Grand Prix", "EventDate": dt.date(2026, 5, 3), "Country": "USA"},
+            ])
+    return drivers, schedule, used_2025_fallback
 
 
 def main():
-    st.set_page_config(
-        page_title="F1 Race Predictor",
-        page_icon="🏎️",
-        layout="wide",
-    )
+    st.set_page_config(page_title="F1 Race Predictor", page_icon="🏎️", layout="wide")
+    init_session_state()
 
     st.title("F1 Race Prediction Dashboard")
     st.markdown(
-        "Uses **FastF1** data to stay up-to-date with the current and upcoming races. "
-        "Predictions are based on recent race finishing positions across this and recent seasons."
+        "**Qualifying** prediction (1–22) can be used as the **race** starting grid. "
+        "2025 fallback is automatic when 2026 data is missing."
     )
 
     enable_fastf1_cache()
 
-    # Sidebar controls
-    today = dt.date.today()
-    current_year = today.year
-
     with st.sidebar:
         st.header("Configuration")
-        year = st.number_input("Season year", min_value=2014, max_value=current_year + 1, value=current_year, step=1)
-        history_races = st.slider(
-            "Number of previous races to use for prediction",
-            min_value=1,
-            max_value=8,
-            value=3,
-        )
+        year = st.number_input("Season year", min_value=2020, max_value=2030, value=2026, step=1)
+        weather_options = ["Dry", "Wet", "Rain"]
+        weather_str = st.radio("Weather", options=weather_options, index=0)
 
-        st.caption(
-            "The app automatically updates schedules and results whenever new races are added to FastF1."
-        )
+    drivers_df, schedule_df, used_2025_fallback = load_drivers_and_schedule(year)
+    if drivers_df.empty:
+        st.error("Could not load drivers.")
+        return
+    if used_2025_fallback:
+        st.info("No usable 2026 results/form yet → using adjusted 2025 baseline.")
 
-    # Load and display schedule
-    with st.spinner("Loading season schedule from FastF1..."):
-        schedule_df = get_event_schedule(year)
+    drivers_df = drivers_df.copy()
+    if "DriverName" not in drivers_df.columns:
+        drivers_df["DriverName"] = drivers_df.get("Abbreviation", "?")
+    driver_options = drivers_df["DriverName"].astype(str).tolist()
 
     if schedule_df.empty:
-        st.error("No schedule data found for this year.")
-        return
+        event_name = "Australian Grand Prix"
+        round_number = 1
+    else:
+        event_labels = [
+            f"Round {int(r['RoundNumber'])} — {r['EventName']} ({r['EventDate']})"
+            for _, r in schedule_df.iterrows()
+        ]
+        selected = st.selectbox("Select race", event_labels, index=0)
+        round_number = int(selected.split()[1])
+        event_name = schedule_df.loc[schedule_df["RoundNumber"] == round_number, "EventName"].iloc[0]
 
-    # Mark completed vs upcoming races
-    schedule_df = schedule_df.copy()
-    schedule_df["Status"] = np.where(schedule_df["EventDate"] < today, "Completed", "Upcoming")
+    tab_quali, tab_race = st.tabs(["Qualifying", "Race"])
 
-    col_left, col_right = st.columns([1.2, 1])
-
-    with col_left:
-        st.subheader(f"{year} Race Calendar")
-        st.dataframe(
-            schedule_df.rename(
-                columns={
-                    "RoundNumber": "Round",
-                    "EventName": "Grand Prix",
-                    "EventDate": "Date",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # Race selection (all races, past and future)
-    event_labels = [
-        f"Round {int(row.RoundNumber)} - {row.EventName} ({row.EventDate})"
-        for _, row in schedule_df.iterrows()
-    ]
-
-    with col_right:
-        st.subheader("Select Race")
-        selected_label = st.selectbox("Choose a race (completed or upcoming)", event_labels)
-        selected_round = int(selected_label.split()[1])
-        selected_event = schedule_df.loc[schedule_df["RoundNumber"] == selected_round].iloc[0]
-
-        st.markdown(
-            f"**Selected:** {selected_event['EventName']}  \n"
-            f"**Date:** {selected_event['EventDate']}  \n"
-            f"**Status:** {selected_event['Status']}"
-        )
-
-        run_prediction = st.button("Run Prediction")
-
-    st.markdown("---")
-
-    if not run_prediction:
-        st.info("Select a race and click **Run Prediction** to generate the predicted order.")
-        return
-
-    with st.spinner("Building prediction from recent races..."):
-        pred_df = build_prediction_for_event(year, selected_round, history_races)
-
-    if pred_df.empty:
-        st.warning(
-            "Not enough historical race data available to build a prediction for this event. "
-            "Try selecting a later round or reducing the number of history races."
-        )
-        return
-
-    st.subheader("Predicted Finishing Order")
-    pred_table = (
-        pred_df[["PredictedRank", "Driver", "Team"]]
-        .rename(columns={"PredictedRank": "P"})
-    )
-    st.dataframe(
-        pred_table,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    # If the race is completed, show actual results and a simple comparison
-    if selected_event["EventDate"] < today:
-        try:
-            with st.spinner("Loading actual results for comparison..."):
-                actual_df = load_race_results(year, selected_round)
-        except Exception as exc:
-            st.error(f"Could not load actual results for this race: {exc}")
-            return
-
-        actual_df = actual_df.rename(
-            columns={
-                "Abbreviation": "Driver",
-                "TeamName": "Team",
-                "Position": "ActualPosition",
-            }
-        )
-
-        merged = pd.merge(
-            pred_df,
-            actual_df[["Driver", "ActualPosition"]],
-            on="Driver",
-            how="left",
-        )
-        merged["Error"] = merged["ActualPosition"] - merged["PredictedRank"]
-
-        st.subheader("Prediction vs Actual")
-
-        # Side‑by‑side: visual chart and detailed table
-        vis_col, table_col = st.columns([1.2, 1])
-
-        valid_for_chart = merged.dropna(subset=["ActualPosition"]).copy()
-        if not valid_for_chart.empty:
-            chart = (
-                alt.Chart(valid_for_chart)
-                .mark_circle(size=80, opacity=0.9)
-                .encode(
-                    x=alt.X("PredictedRank:Q", title="Predicted Position (1 = best)", scale=alt.Scale(reverse=False)),
-                    y=alt.Y("ActualPosition:Q", title="Actual Position (1 = best)", scale=alt.Scale(reverse=False)),
-                    color=alt.Color("Team:N", legend=None),
-                    tooltip=["Driver", "Team", "PredictedRank", "ActualPosition", "Error"],
+    # ---------- Qualifying tab ----------
+    with tab_quali:
+        st.subheader("Predicted qualifying order (1–22)")
+        if st.button("Predict Qualifying", key="predict_quali"):
+            with st.spinner("Predicting qualifying..."):
+                result = predict_quali_order(
+                    drivers_df,
+                    circuit=event_name,
+                    weather_str=weather_str,
+                    year=year,
+                    round_number=round_number,
+                    return_debug=True,
                 )
-            )
+            quali_df = result[0] if isinstance(result, tuple) else result
+            quali_debug = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            if quali_df is not None and not quali_df.empty:
+                st.session_state.predicted_quali_grid = quali_to_grid_df(quali_df, drivers_df)
+                st.dataframe(quali_df, use_container_width=True, hide_index=True)
+                if quali_debug:
+                    with st.expander("Debug: quali features and sample"):
+                        st.write("**Weather:**", quali_debug.get("weather", "—"))
+                        st.write("**Weather encoded:**", quali_debug.get("weather_encoded", []))
+                        st.write("**Feature names:**", quali_debug.get("feature_names", []))
+                        st.write("**X sample (first row):**", quali_debug.get("X_sample", {}))
+                        st.write("**X shape:**", quali_debug.get("X_shape", "—"))
+                        if quali_debug.get("feature_importances"):
+                            st.write("**Feature importances:**", quali_debug.get("feature_importances"))
+            else:
+                st.warning("No qualifying prediction produced.")
+        else:
+            if st.session_state.predicted_quali_grid is not None:
+                st.dataframe(
+                    st.session_state.predicted_quali_grid[["PredictedQualiPos", "Driver", "Team"]].rename(columns={"PredictedQualiPos": "P"})
+                    if "PredictedQualiPos" in st.session_state.predicted_quali_grid.columns
+                    else st.session_state.predicted_quali_grid,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption("Using last predicted qualifying grid for race (see Race tab).")
+            else:
+                st.info("Click **Predict Qualifying** to get an order and use it as the race grid.")
 
-            # Diagonal reference line (perfect prediction)
-            max_pos = int(max(valid_for_chart["PredictedRank"].max(), valid_for_chart["ActualPosition"].max()))
-            diag_df = pd.DataFrame({"PredictedRank": list(range(1, max_pos + 1)), "ActualPosition": list(range(1, max_pos + 1))})
-            diag = (
-                alt.Chart(diag_df)
-                .mark_line(strokeDash=[4, 4], color="gray")
-                .encode(x="PredictedRank:Q", y="ActualPosition:Q")
-            )
-
-            with vis_col:
-                st.caption("Dots close to the diagonal line = better predictions.")
-                st.altair_chart((chart + diag).properties(height=350), use_container_width=True)
-
-        with table_col:
-            merged_table = merged[
-                [
-                    "PredictedRank",
-                    "Driver",
-                    "Team",
-                    "ActualPosition",
-                    "Error",
-                ]
-            ].rename(
-                columns={
-                    "PredictedRank": "Pred",
-                    "ActualPosition": "Actual",
-                }
-            )
+    # ---------- Race tab ----------
+    with tab_race:
+        override_manual = st.checkbox("Override with manual grid", value=False, key="override_grid")
+        if override_manual or st.session_state.predicted_quali_grid is None:
+            st.subheader("Grid order (starting positions 1–22)")
+            st.caption("Assign each position to a driver, or run Qualifying prediction first to auto-fill.")
+            grid_assignments = []
+            n_drivers = min(22, len(driver_options))
+            cols = st.columns(4)
+            for pos in range(1, n_drivers + 1):
+                with cols[(pos - 1) % 4]:
+                    default_idx = (pos - 1) % len(driver_options)
+                    chosen = st.selectbox(f"P{pos}", options=driver_options, index=default_idx, key=f"grid_{pos}")
+                    grid_assignments.append((pos, chosen))
+            grid_list = []
+            for pos, driver_name in grid_assignments:
+                row = drivers_df[drivers_df["DriverName"].astype(str) == driver_name].iloc[0]
+                grid_list.append({
+                    "DriverName": row["DriverName"],
+                    "Abbreviation": row.get("Abbreviation", driver_name[:3]),
+                    "TeamName": row["TeamName"],
+                    "GridPosition": pos,
+                })
+            grid_df = pd.DataFrame(grid_list)
+        else:
+            grid_df = st.session_state.predicted_quali_grid.copy()
+            st.subheader("Grid order (from predicted qualifying)")
             st.dataframe(
-                merged_table,
+                grid_df[["GridPosition", "DriverName", "TeamName"]].rename(columns={"DriverName": "Driver", "GridPosition": "P"}),
                 use_container_width=True,
                 hide_index=True,
             )
 
-        # Optional compact backtest metrics in an expander
-        valid = merged.dropna(subset=["ActualPosition"])
-        if not valid.empty:
-            with st.expander("Show backtest metrics for this race"):
-                mae = (valid["Error"].abs()).mean()
+        run_predict = st.button("Run Race Prediction", key="run_race")
 
-                pred_top3 = set(valid.loc[valid["PredictedRank"] <= 3, "Driver"])
-                actual_top3 = set(valid.loc[valid["ActualPosition"] <= 3, "Driver"])
-                top3_overlap = len(pred_top3 & actual_top3)
-
-                winner_row = valid.loc[valid["ActualPosition"] == 1]
-                winner_in_top3 = False
-                if not winner_row.empty:
-                    winner_pred_rank = int(winner_row["PredictedRank"].min())
-                    winner_in_top3 = winner_pred_rank <= 3
-
-                col_m1, col_m2, col_m3 = st.columns(3)
-                col_m1.metric("Mean Abs Error", f"{mae:.2f}")
-                col_m2.metric("Top-3 Overlap", f"{top3_overlap}")
-                col_m3.metric(
-                    "Winner in Pred Top 3",
-                    "Yes" if winner_in_top3 else "No",
+        if not run_predict:
+            st.info("Click **Run Race Prediction** to get predicted finishing order.")
+        else:
+            with st.spinner("Predicting finishing order..."):
+                result = predict_finishing_order(
+                    grid_df,
+                    circuit=event_name,
+                    weather_str=weather_str,
+                    year=year,
+                    round_number=round_number,
+                    use_xgboost=True,
+                    force_heuristic=False,
+                    return_debug=True,
                 )
+            pred_df = result[0] if isinstance(result, tuple) else result
+            debug_info = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+
+            if pred_df.empty:
+                st.warning("No prediction produced.")
+            else:
+                st.subheader("Predicted finishing order")
+                st.dataframe(pred_df, use_container_width=True, hide_index=True)
+                if debug_info:
+                    with st.expander("Debug: race weather encoding and features"):
+                        st.write("**Selected weather:**", debug_info.get("weather", "—"))
+                        st.write("**Weather one-hot:**", debug_info.get("weather_encoded", []))
+                        st.write("**Feature names:**", debug_info.get("feature_names", []))
+                        st.write("**X sample (first row):**", debug_info.get("X_sample", {}))
+                        st.write("**X shape:**", debug_info.get("X_shape", "—"))
+                        imp = debug_info.get("feature_importances")
+                        if imp:
+                            if isinstance(imp, dict):
+                                top10 = sorted(imp.items(), key=lambda x: -x[1])[:10]
+                                st.write("**Top 10 feature importances:**", {k: round(v, 4) for k, v in top10})
+                            else:
+                                st.write("**Feature importances:**", imp)
+
+                pred_df = pred_df.copy()
+                pred_df["Strength"] = (len(pred_df) + 1) - pred_df["PredictedRank"]
+                chart = alt.Chart(pred_df).mark_bar().encode(
+                    x=alt.X("Driver:N", sort="-y"),
+                    y="Strength:Q",
+                    color="Team:N",
+                    tooltip=["Driver", "Team", "PredictedRank"],
+                ).properties(height=350)
+                st.altair_chart(chart, use_container_width=True)
+
+            today = dt.date.today()
+            if "EventDate" in schedule_df.columns:
+                schedule_df["EventDate"] = pd.to_datetime(schedule_df["EventDate"]).dt.date
+            event_dates = schedule_df[schedule_df["RoundNumber"] == round_number]["EventDate"] if not schedule_df.empty else pd.Series(dtype=object)
+            if not event_dates.empty and event_dates.iloc[0] < today:
+                try:
+                    with st.spinner("Loading actual results..."):
+                        actual = load_race_results(year, round_number)
+                    if not actual.empty:
+                        actual = actual.rename(columns={"Position": "ActualPosition"})
+                        pred_with_abbrev = pred_df.merge(
+                            grid_df[["DriverName", "Abbreviation"]],
+                            left_on="Driver",
+                            right_on="DriverName",
+                            how="left",
+                        )
+                        merged = pred_with_abbrev.merge(actual[["Abbreviation", "ActualPosition"]], on="Abbreviation", how="left")
+                        merged["Error"] = merged["ActualPosition"] - merged["PredictedRank"]
+                        st.subheader("Prediction vs actual")
+                        st.dataframe(
+                            merged[["PredictedRank", "Driver", "Team", "ActualPosition", "Error"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        mae = merged["Error"].abs().mean()
+                        st.metric("Mean absolute error", f"{mae:.2f} positions")
+                except Exception as e:
+                    st.caption(f"Could not load actual results: {e}")
+
+    st.caption(
+        "Retrain race model: `python scripts/train_model.py` (trains both race and quali models)."
+    )
 
 
 if __name__ == "__main__":
     main()
-
