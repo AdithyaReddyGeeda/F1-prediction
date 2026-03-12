@@ -1,39 +1,33 @@
 # F1 Race Prediction (FastF1 + Streamlit)
 
-This app predicts Formula 1 race results using recent race performance data from the **FastF1** API and exposes a clean **Streamlit** dashboard.
+This app predicts **Formula 1 qualifying and race** results using the **FastF1** API and an **XGBoost** race model (with heuristic fallbacks). A **Streamlit** dashboard provides qualifying predictions, race predictions, and comparison with actual results.
 
-It stays up to date automatically, because schedules and results are pulled live from FastF1 for the selected season and race.
+Schedules and results are pulled from FastF1, with automatic fallback to 2025 data when the selected season (e.g. 2026) has no or insufficient results.
 
-## Early 2026 handling: auto-fallback to 2025 + adjustments
+## Early 2026 / new season handling
 
-For the **first race of the season** or when **2026 data is sparse** (e.g. Australian GP just run, API not yet updated):
-
-1. **Fallback chain**: The app tries **FastF1 2026** first, then **2025 data** as baseline, then a **hardcoded 2026 grid** (22 drivers, 11 teams) so you always get a prediction.
-2. **2026 grid**: Confirmed lineup is in `config.py` (Mercedes, Ferrari, McLaren, Red Bull Racing, Haas, Racing Bulls, Audi, Alpine, Williams, Cadillac, Aston Martin) with real driver names — no placeholders.
-3. **Transfers and rookies**: Drivers who changed team (e.g. Hamilton → Ferrari, Perez → Cadillac) are mapped to 2026 teams; rookies (e.g. Antonelli, Lindblad, Bortoleto, Bearman) get a default **midfield form** (avg position ~12) when no F1 history exists.
-4. **Manual override**: Use the sidebar option **“Force use 2025 data as baseline”** when you want to base form purely on last year.
+- **Fallback**: The app tries the selected year first; if data is missing or the grid has fewer than 22 drivers, it **automatically** uses 2025 as baseline (no user toggle).
+- **Grid**: 22 drivers and 11 teams come from FastF1, web scraping (official F1 site), or a hardcoded list in `config.py` for 2026.
+- **Rookies / new teams**: Drivers with no F1 history get a default midfield form (~12); the model uses EWMA form, track-specific stats, and quali position where available.
 
 ## Features
 
-- **Live schedule**: load the full race calendar for any season.
-- **Future race predictions**: choose any upcoming race and get a predicted finishing order.
-- **Historical context**: model uses the most recent completed races across this and recent seasons.
-- **Completed race analysis**:
-  - Side‑by‑side **Prediction vs Actual** table.
-  - Interactive scatter plot of predicted vs actual finishing positions (with diagonal “perfect prediction” line).
-  - Optional compact backtest metrics in an expander.
+- **Qualifying prediction**: Predict qualifying order (1–22) from driver/constructor quali form, circuit, and weather. Stored in session state and can be used as the race starting grid.
+- **Race prediction**: XGBoost model (or heuristic) predicts finishing order from grid, form, track-specific stats, weather, teammate delta, DNF rate, and more.
+- **Tabs**: **Qualifying** (predict quali → table + optional debug) and **Race** (grid from quali or manual, run race prediction, charts, prediction vs actual).
+- **Override**: Check **“Override with manual grid”** in the Race tab to set the starting order by hand instead of using the predicted quali grid.
+- **Live schedule**: Full race calendar for the chosen season.
+- **Completed races**: **Prediction vs Actual** table and mean absolute error.
+- **Debug**: Expanders for quali/race feature samples and top feature importances.
 
-## How the prediction works
+## How predictions work
 
-For a selected race:
-
-1. Collect up to **N recent races** (configurable in the sidebar) going backwards from that race across **this and recent seasons**.
-2. Infer the **current season grid** (drivers + teams) from the latest completed race of the selected year.
-3. Restrict historical results to **only those drivers** on the current grid (so no old drivers that left F1).
-4. For each current driver, compute the **average finishing position** over the collected races.
-5. Sort by that average to get the **predicted ranking**, using the **current season’s team** for each driver.
-
-This is a simple but interpretable heuristic model; you can evolve it into a full ML model by adding more features and a learning algorithm.
+1. **Qualifying**: Per-driver quali form (and constructor strength) from recent Q sessions; optional XGBoost quali model. Output is a predicted quali order 1–22.
+2. **Race**:  
+   - If you ran **Predict Qualifying**, that order is used as the starting grid unless you check **Override with manual grid**.  
+   - The race model uses: grid position, quali position, EWMA driver/constructor form, track-specific averages, driver–team synergy, teammate delta, constructor DNF rate, momentum, weather (one-hot), circuit type, and interactions (e.g. grid × rain).  
+   - Predictions are blended with quali (e.g. 0.65× race + 0.35× quali), then ranked per race and clipped to 1–22.  
+   - If no trained model is available, a heuristic (form + grid + weather noise) is used.
 
 ## Local setup
 
@@ -45,65 +39,52 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The first run may take longer because FastF1 needs to download and cache data.
+The first run can be slow while FastF1 downloads and caches data.
 
 ## Usage
 
-1. **Sidebar**: Season **year** (default 2026), **Force use 2025 data as baseline**, and **Weather** (Dry / Wet / Rain).
-2. **Race selector**: Choose a round (e.g. Australian GP, Chinese GP). Schedule comes from FastF1 or a hardcoded 2026 start.
-3. **Grid order**: Assign **starting positions 1–22** to drivers (selectbox per position). Default order is the 2026 list.
-4. Click **Run Prediction** to get predicted finishing order (XGBoost if trained, else heuristic + form).
-5. **Track preview**: Simple Folium map and Plotly chart of predicted order.
-6. For **completed races**, the app shows **Prediction vs Actual** and mean absolute error.
+1. **Sidebar**: Season **year** (default 2026), **Weather** (Dry / Wet / Rain).
+2. **Race**: Select a round (e.g. Australian GP). Schedule is from FastF1 or a built-in 2026 start.
+3. **Qualifying tab**: Click **Predict Qualifying** to get an order 1–22 and optionally inspect the debug expander. This grid is stored for the Race tab.
+4. **Race tab**: By default the predicted quali grid is used. Check **Override with manual grid** to set positions 1–22 manually. Click **Run Race Prediction** for the predicted finishing order, charts, and (for past races) Prediction vs Actual and MAE.
+5. **Track**: Simple Folium map and Plotly chart of predicted order.
 
 ## Deployment on Streamlit Cloud
 
-1. Push this repo to GitHub (already set up as `AdithyaReddyGeeda/F1-prediction`).
-2. Go to Streamlit Cloud and create a **New app**:
-   - Repo: `AdithyaReddyGeeda/F1-prediction`
-   - Branch: `main`
-   - Main file: `app.py`
-3. Deploy. Streamlit will install dependencies from `requirements.txt` and run the app.
+1. Push the repo to GitHub (`AdithyaReddyGeeda/F1-prediction`).
+2. In Streamlit Cloud, create a **New app**: connect the repo, branch `main`, main file `app.py`.
+3. Deploy. Dependencies install from `requirements.txt`. FastF1 cache is created on the server (cache directory is in `.gitignore`).
 
-FastF1 will build its cache on the server filesystem at runtime; the cache directory is ignored in git via `.gitignore`.
+## Training the models (race + qualifying)
 
-## Optional: train XGBoost model
-
-To use the ML model instead of the heuristic for predictions, train on 2020–2025 data (and optionally partial 2026):
+To use the **XGBoost race and quali models** instead of heuristics:
 
 ```bash
 pip install -r requirements.txt
 python scripts/train_model.py
 ```
 
-This saves `model_artifacts/xgboost_model.joblib` and `model_artifacts/encoders.joblib`. The app will load them automatically when you click **Run Prediction**.
+- **Race model**: Trains on 2020–2023, validates on 2024 (time-based split). Uses MAE objective, 80-trial hyperparameter search, StandardScaler on numeric features, and post-processing (blend with quali, rank per race). Saves **only if** validation MAE improves by more than 0.5 vs grid baseline or is below 7.0.
+- **Outputs**:  
+  - `model_artifacts/xgboost_model.joblib`, `model_artifacts/encoders.joblib` (encoders, scaler, lookup maps).  
+  - `model_artifacts/diagnostics.png` (top 15 feature importances, error distribution).  
+  - Console: baseline MAE, correlations (grid/form vs finish), validation MAE/RMSE/R², top 15 importances, sample pred vs actual, worst errors, per-race MAE.
+- **Quali model**: Trains on 2020–2025 quali data; saves to `models/quali_model.joblib` and `models/quali_encoders.joblib`.
 
-## How to improve MAE (from ~7.45 → target &lt;6.0)
+The app loads these artifacts automatically when you run **Predict Qualifying** and **Run Race Prediction**.
 
-The race model is trained to minimize **Mean Absolute Error (MAE)** on hold-out seasons. To push MAE below 6.0 (ideally 5.0–5.5) without data leakage:
+## How to improve MAE (target &lt;6.0)
 
-1. **Feature engineering** (in `utils/race_features.py` and training):
-   - **EWMA form**: Exponentially weighted moving average of last 5–10 race positions (alpha ≈ 0.3–0.5) for driver and constructor.
-   - **Track-specific performance**: Driver/constructor average finish at this circuit (last 3–5 visits).
-   - **Quali strength**: Historical or predicted qualifying position (or gap to pole).
-   - **Driver–team synergy**: Historical average finish for this driver with this constructor.
-   - **Weather interactions**: Driver rain delta (avg position wet vs dry), team wet performance.
-   - **Momentum**: Position change last race; relative to teammate.
-   - **Circuit type**: Street / high-speed / technical dummies if derivable.
-   - **DNF handling**: Impute finish position 20–22 from Status/laps when driver did not finish.
+The race model is tuned for **Mean Absolute Error** on a hold-out season. To push MAE lower:
 
-2. **Model and validation**:
-   - Objective `reg:absoluteerror` (optimizes MAE directly).
-   - **Time-series validation**: Train on earlier seasons (e.g. 2020–2023), validate on 2024, test on 2025 (no random split).
-   - **Hyperparameter tuning**: RandomizedSearchCV or Optuna (n_estimators 300–1000, max_depth 3–8, learning_rate 0.01–0.1, subsample, colsample_bytree, reg_alpha/lambda, min_child_weight).
-   - **Early stopping** on validation set.
-   - **Feature selection**: Drop features with importance &lt; 0.01 after training.
+1. **Features** (in `utils/race_features.py` and training):  
+   EWMA driver/constructor form, track-specific driver/team averages, quali position, driver–team synergy, **teammate delta**, **constructor DNF rate**, **form × teammate_delta**, momentum, driver rain delta, circuit type, DNF imputation, grid × rain.
 
-3. **Post-processing and ensemble**:
-   - Clip predictions to 1–22; optionally sort to enforce logical order.
-   - Light ensemble: e.g. 60% race model + 40% quali-predicted position.
+2. **Training**:  
+   `reg:absoluteerror`, time-based train/val split, **RandomizedSearchCV** (e.g. 80 trials), early stopping, **StandardScaler** on numerics, oversample wet/rain if &lt;10%.
 
-4. **Retrain and compare**:
-   - Run `python scripts/train_model.py` and check the printed **validation MAE** and **top feature importances**.
-   - Use the debug expander in the app to inspect feature values and importances.
+3. **Post-processing**:  
+   Blend (e.g. 0.65× race + 0.35× quali), assign ranks per race (no ties), clip to 1–22.
 
+4. **Retrain**:  
+   Run `python scripts/train_model.py` and compare validation MAE and `diagnostics.png`; use the app’s debug expanders to inspect features and importances.
