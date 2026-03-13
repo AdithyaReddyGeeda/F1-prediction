@@ -13,7 +13,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import GRID_2026, ROOKIE_DEFAULT_AVG_POSITION
+from config import GRID_2026, ROOKIE_DEFAULT_AVG_POSITION, ENGINE_BY_TEAM
 
 WEATHER_CATEGORIES = ["Dry", "Wet", "Rain"]
 
@@ -24,7 +24,7 @@ def load_historical_results(start_year: int = 2020, end_year: int = 2025) -> pd.
     cache_dir = ROOT / "fastf1_cache"
     cache_dir.mkdir(exist_ok=True)
     fastf1.Cache.enable_cache(cache_dir)
-    from data import get_event_schedule, load_race_results
+    from data import get_event_schedule, load_race_results, load_race_weather, load_race_tyre_proxy
     rows = []
     for year in range(start_year, end_year + 1):
         try:
@@ -114,6 +114,30 @@ def load_historical_fp_deltas(start_year: int = 2020, end_year: int = 2025) -> p
     return pd.concat(rows, ignore_index=True)
 
 
+def load_historical_tyre_proxy(start_year: int = 2020, end_year: int = 2025) -> pd.DataFrame:
+    """Load stint-based tyre proxy (avg laps per stint) for all races. Empty DataFrame on failure."""
+    from data import get_event_schedule
+    rows = []
+    for year in range(start_year, end_year + 1):
+        try:
+            sched = get_event_schedule(year)
+            if sched.empty:
+                continue
+            for _, row in sched.iterrows():
+                r = int(row["RoundNumber"])
+                try:
+                    tp = load_race_tyre_proxy(year, r)
+                    if not tp.empty:
+                        rows.append(tp)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
 def oversample_wet_rain(df: pd.DataFrame, target_min_pct: float = 0.25, rng=None) -> pd.DataFrame:
     """Oversample Wet and Rain rows so model sees enough weather signal. Aggressive if <10%."""
     if rng is None:
@@ -171,12 +195,25 @@ def main():
     if fp_df.empty:
         fp_df = None
 
+    print("Loading stint-based tyre proxy (optional)...")
+    tyre_proxy_df = load_historical_tyre_proxy(2020, 2025)
+    if tyre_proxy_df.empty:
+        tyre_proxy_df = None
+
     rng = np.random.default_rng(42)
     keys = race_df[["Year", "Round"]].drop_duplicates()
-    w = rng.random(len(keys))
-    weather_per_race = dict(
-        zip(zip(keys["Year"], keys["Round"]), np.where(w < 0.50, "Dry", np.where(w < 0.80, "Wet", "Rain")))
-    )
+    # Real weather from FastF1 where available; fallback to random for missing
+    weather_per_race = {}
+    real_count = 0
+    for _, row in keys.iterrows():
+        y, r = int(row["Year"]), int(row["Round"])
+        real = load_race_weather(y, r)
+        if real is not None:
+            weather_per_race[(y, r)] = real
+            real_count += 1
+        else:
+            weather_per_race[(y, r)] = rng.choice(["Dry", "Wet", "Rain"], p=[0.5, 0.3, 0.2])
+    print("Weather: using real FastF1 for {}/{} races (rest random)".format(real_count, len(keys)))
 
     # EWMA alpha grid search (0.3–0.6): pick best alpha by validation MAE with a quick model
     print("EWMA alpha grid search (0.3, 0.4, 0.5, 0.6)...")
@@ -187,6 +224,7 @@ def main():
             quali_df=quali_df,
             weather_per_race=weather_per_race,
             fp_df=fp_df,
+            tyre_proxy_df=tyre_proxy_df,
             ewma_alpha=alpha,
         )
         X_alpha = oversample_wet_rain(X_alpha, target_min_pct=0.25, rng=rng)
@@ -201,9 +239,11 @@ def main():
         grid_2026 = pd.DataFrame(GRID_2026)
         enc_d.fit(list(X_alpha["Abbreviation"].unique()) + list(grid_2026["Abbreviation"].unique()))
         enc_t.fit(list(X_alpha["TeamName"].unique()) + list(grid_2026["TeamName"].unique()))
+        enc_e = LabelEncoder()
+        enc_e.fit(list(X_alpha["engine_supplier"].unique()) + [ENGINE_BY_TEAM.get(t, "Other") for t in grid_2026["TeamName"].unique()])
         enc_c.fit(list(X_alpha["Circuit"].unique()) + ["Australian Grand Prix"])
         enc_w.fit(np.array(WEATHER_CATEGORIES).reshape(-1, 1))
-        for c in ["driver_enc", "team_enc", "circuit_enc", "weather_Dry", "weather_Wet", "weather_Rain",
+        for c in ["driver_enc", "team_enc", "engine_enc", "circuit_enc", "weather_Dry", "weather_Wet", "weather_Rain",
                   "FP1_delta", "FP2_delta", "FP3_delta", "circuit_abrasion_proxy", "tyre_life_penalty_proxy",
                   "driver_dnf_rate", "driver_tyre_management_proxy"]:
             if c not in X_alpha.columns and "enc" in c:
@@ -212,6 +252,8 @@ def main():
                 X_alpha["driver_enc"] = enc_d.transform(X_alpha["Abbreviation"].astype(str))
             elif c == "team_enc":
                 X_alpha["team_enc"] = enc_t.transform(X_alpha["TeamName"].astype(str))
+            elif c == "engine_enc":
+                X_alpha["engine_enc"] = enc_e.transform(X_alpha["engine_supplier"].astype(str))
             elif c == "circuit_enc":
                 X_alpha["circuit_enc"] = enc_c.transform(X_alpha["Circuit"].astype(str))
             elif c == "weather_Dry":
@@ -223,7 +265,7 @@ def main():
             "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
             "form_x_teammate_delta", "momentum", "driver_rain_delta",
             "FP1_delta", "FP2_delta", "FP3_delta",
-            "driver_enc", "team_enc", "circuit_enc",
+            "driver_enc", "team_enc", "engine_enc", "circuit_enc",
             "circuit_type_street", "circuit_type_high_speed", "circuit_type_technical",
             "weather_Dry", "weather_Wet", "weather_Rain", "grid_pos_x_rain",
         ]
@@ -238,7 +280,7 @@ def main():
         if val_m.sum() == 0:
             continue
         from sklearn.preprocessing import StandardScaler
-        scale_idx_a = [i for i, n in enumerate(feat_cols_alpha) if n not in ("driver_enc", "team_enc", "circuit_enc") and not n.startswith("weather_") and not n.startswith("circuit_type_")]
+        scale_idx_a = [i for i, n in enumerate(feat_cols_alpha) if n not in ("driver_enc", "team_enc", "engine_enc", "circuit_enc") and not n.startswith("weather_") and not n.startswith("circuit_type_")]
         scaler_a = StandardScaler()
         X_t = X_mat[train_m].copy()
         X_v = X_mat[val_m].copy()
@@ -259,12 +301,13 @@ def main():
             pass
     print("Best EWMA alpha: {:.1f} (val MAE: {:.3f})".format(best_alpha, best_alpha_mae))
 
-    print("Building race features (EWMA alpha={}, track, synergy, tyre, practice)...".format(best_alpha))
+    print("Building race features (EWMA alpha={}, track, synergy, tyre, practice, engine)...".format(best_alpha))
     X_df = build_race_feature_df(
         race_df,
         quali_df=quali_df,
         weather_per_race=weather_per_race,
         fp_df=fp_df,
+        tyre_proxy_df=tyre_proxy_df,
         ewma_alpha=best_alpha,
     )
     X_df = oversample_wet_rain(X_df, target_min_pct=0.25, rng=rng)
@@ -275,31 +318,35 @@ def main():
     all_drivers = list(X_df["Abbreviation"].unique()) + list(grid_2026["Abbreviation"].unique())
     all_teams = list(X_df["TeamName"].unique()) + list(grid_2026["TeamName"].unique())
     all_circuits = list(X_df["Circuit"].unique()) + ["Australian Grand Prix", "Melbourne"]
+    all_engines = list(X_df["engine_supplier"].unique()) + [ENGINE_BY_TEAM.get(t, "Other") for t in grid_2026["TeamName"].unique()]
     enc_driver = LabelEncoder()
     enc_team = LabelEncoder()
+    enc_engine = LabelEncoder()
     enc_circuit = LabelEncoder()
     enc_weather = OneHotEncoder(categories=[WEATHER_CATEGORIES], drop=None, sparse_output=False)
     enc_driver.fit(list(dict.fromkeys(all_drivers)))
     enc_team.fit(list(dict.fromkeys(all_teams)))
+    enc_engine.fit(list(dict.fromkeys(all_engines)))
     enc_circuit.fit(list(dict.fromkeys(all_circuits)))
     enc_weather.fit(np.array(WEATHER_CATEGORIES).reshape(-1, 1))
 
     X_df["driver_enc"] = enc_driver.transform(X_df["Abbreviation"].astype(str))
     X_df["team_enc"] = enc_team.transform(X_df["TeamName"].astype(str))
+    X_df["engine_enc"] = enc_engine.transform(X_df["engine_supplier"].astype(str))
     X_df["circuit_enc"] = enc_circuit.transform(X_df["Circuit"].astype(str))
     wo = enc_weather.transform(X_df[["Weather"]].values)
     X_df["weather_Dry"] = wo[:, 0]
     X_df["weather_Wet"] = wo[:, 1]
     X_df["weather_Rain"] = wo[:, 2]
 
-    # Feature columns (order must match inference); include tyre, driver_dnf, practice deltas
+    # Feature columns (order must match inference); include engine_enc, tyre, driver_dnf, practice deltas
     feat_cols = [
         "GridPosition", "QualiPosition", "RecentForm", "ConstructorEwma",
         "track_avg_driver", "track_avg_team", "driver_team_synergy", "teammate_delta", "constructor_dnf_rate",
         "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
         "form_x_teammate_delta", "momentum", "driver_rain_delta",
         "FP1_delta", "FP2_delta", "FP3_delta",
-        "driver_enc", "team_enc", "circuit_enc",
+        "driver_enc", "team_enc", "engine_enc", "circuit_enc",
         "circuit_type_street", "circuit_type_high_speed", "circuit_type_technical",
         "weather_Dry", "weather_Wet", "weather_Rain", "grid_pos_x_rain",
     ]
@@ -325,7 +372,7 @@ def main():
 
     # StandardScaler on numeric features (same order as feat_cols)
     from sklearn.preprocessing import StandardScaler
-    scale_idx = [i for i, n in enumerate(feat_cols) if n not in ("driver_enc", "team_enc", "circuit_enc") and not n.startswith("weather_") and not n.startswith("circuit_type_")]
+    scale_idx = [i for i, n in enumerate(feat_cols) if n not in ("driver_enc", "team_enc", "engine_enc", "circuit_enc") and not n.startswith("weather_") and not n.startswith("circuit_type_")]
     scaler = StandardScaler()
     X_train_scaled = X_train.copy()
     X_val_scaled = X_val.copy()
@@ -514,6 +561,7 @@ def main():
         joblib.dump({
             "driver": enc_driver,
             "team": enc_team,
+            "engine": enc_engine,
             "circuit": enc_circuit,
             "weather_encoder": enc_weather,
             "feature_names": feature_names,

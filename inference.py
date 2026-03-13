@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import ROOKIE_DEFAULT_AVG_POSITION
+from config import ROOKIE_DEFAULT_AVG_POSITION, ENGINE_BY_TEAM
 
 # Heuristic fallback (no xgboost required)
 from model import build_prediction_for_event
@@ -259,6 +259,10 @@ def _build_features(
             return np.array(out)
         driver_enc = _safe_transform(enc_driver, abbrevs)
         team_enc = _safe_transform(enc_team, teams)
+        use_engine = "engine_enc" in (feature_names or [])
+        enc_engine = encoders.get("engine")
+        engines = [ENGINE_BY_TEAM.get(t, "Other") for t in teams]
+        engine_enc = (_safe_transform(enc_engine, engines) if enc_engine is not None else np.zeros(n, dtype=int)) if use_engine else None
         circuit_enc = _safe_transform(enc_circuit, [circuit] * n)
         recent_form = np.array([form.get(a, ROOKIE_AVG_POS) for a in abbrevs], dtype=float)
 
@@ -291,37 +295,21 @@ def _build_features(
             circuit_type_street = np.full(n, street)
             circuit_type_high_speed = np.full(n, high)
             circuit_type_technical = np.full(n, tech)
-            X = np.column_stack([
-                grid_pos,
-                quali_pos,
-                recent_form,
-                constructor_ewma,
-                track_avg_driver,
-                track_avg_team,
-                driver_team_synergy,
-                teammate_delta,
-                constructor_dnf_rate,
-                driver_dnf_rate,
-                circuit_abrasion_proxy,
-                tyre_life_penalty_proxy,
-                driver_tyre_management_proxy,
-                form_x_teammate_delta,
-                momentum,
-                driver_rain_delta,
-                fp1_delta,
-                fp2_delta,
-                fp3_delta,
-                driver_enc,
-                team_enc,
-                circuit_enc,
-                circuit_type_street,
-                circuit_type_high_speed,
-                circuit_type_technical,
-                weather_onehot[:, 0],
-                weather_onehot[:, 1],
-                weather_onehot[:, 2],
-                grid_pos_x_rain,
+            stack_parts = [
+                grid_pos, quali_pos, recent_form, constructor_ewma,
+                track_avg_driver, track_avg_team, driver_team_synergy, teammate_delta,
+                constructor_dnf_rate, driver_dnf_rate, circuit_abrasion_proxy, tyre_life_penalty_proxy,
+                driver_tyre_management_proxy, form_x_teammate_delta, momentum, driver_rain_delta,
+                fp1_delta, fp2_delta, fp3_delta,
+                driver_enc, team_enc,
+            ]
+            if engine_enc is not None:
+                stack_parts.append(engine_enc)
+            stack_parts.extend([
+                circuit_enc, circuit_type_street, circuit_type_high_speed, circuit_type_technical,
+                weather_onehot[:, 0], weather_onehot[:, 1], weather_onehot[:, 2], grid_pos_x_rain,
             ])
+            X = np.column_stack(stack_parts)
             scaler = encoders.get("scaler")
             scale_idx = encoders.get("scale_idx")
             if scaler is not None and scale_idx is not None:

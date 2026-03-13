@@ -28,9 +28,39 @@ def get_event_schedule(year: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_race_weather(year: int, round_number: int) -> Optional[str]:
+    """
+    Load real weather for a race from FastF1 session.weather_data.
+    Returns "Dry", "Wet", or "Rain" when available; None if not available.
+    """
+    try:
+        session = fastf1.get_session(year, round_number, "R")
+        session.load()
+        w = getattr(session, "weather_data", None)
+        if w is None or (hasattr(w, "empty") and w.empty):
+            return None
+        # FastF1 weather_data can have 'Rain' column (bool) or similar
+        if hasattr(w, "columns") and "Rain" in w.columns:
+            if w["Rain"].any() if hasattr(w["Rain"], "any") else bool(w["Rain"].iloc[0]):
+                return "Rain"
+        if hasattr(w, "columns") and "Wet" in w.columns:
+            if w["Wet"].any() if hasattr(w["Wet"], "any") else bool(w["Wet"].iloc[0]):
+                return "Wet"
+        # Some APIs use 'Rainfall' or numeric rain indicator
+        for col in ("Rainfall", "Humidity", "Precipitation"):
+            if hasattr(w, "columns") and col in w.columns:
+                ser = w[col]
+                if ser.dtype in ("bool", "int", "float") and (ser.astype(float) > 0).any():
+                    return "Wet"
+        return "Dry"
+    except Exception:
+        return None
+
+
 def load_race_results(year: int, round_number: int) -> pd.DataFrame:
     """Load race results (finish positions) for a specific event. Empty DataFrame on failure.
-    Includes Status when available for DNF handling in training."""
+    Includes Status and Laps when available for DNF handling in training.
+    Adds RaceLaps (total race laps) when available for <50% laps imputation."""
     try:
         session = fastf1.get_session(year, round_number, "R")
         session.load()
@@ -38,37 +68,57 @@ def load_race_results(year: int, round_number: int) -> pd.DataFrame:
         cols = ["DriverNumber", "Abbreviation", "TeamName", "Position"]
         if "Status" in results.columns:
             cols.append("Status")
+        if "Laps" in results.columns:
+            cols.append("Laps")
         df = results[[c for c in cols if c in results.columns]].copy()
         df["Position"] = pd.to_numeric(df["Position"], errors="coerce")
+        if "Laps" in df.columns:
+            df["Laps"] = pd.to_numeric(df["Laps"], errors="coerce")
+        # Total race laps for <50% imputation (session.total_laps or max completed)
+        total_laps = getattr(session, "total_laps", None)
+        if total_laps is None and "Laps" in df.columns:
+            total_laps = df["Laps"].max()
+        if total_laps is not None and not pd.isna(total_laps):
+            df["RaceLaps"] = int(total_laps)
         return df
     except Exception:
         return pd.DataFrame()
 
 
-def load_fp_deltas(year: int, round_number: int) -> pd.DataFrame:
+def load_fp_deltas(year: int, round_number: int, max_retries: int = 2) -> pd.DataFrame:
     """
     Load FP1/FP2/FP3 best lap deltas to session fastest (seconds).
-    Returns DataFrame with Year, Round, Abbreviation, FP1_delta, FP2_delta, FP3_delta (NaN if no data).
+    Retries each session up to max_retries on failure. Returns DataFrame with
+    Year, Round, Abbreviation, FP1_delta, FP2_delta, FP3_delta (no data → 0 in feature pipeline).
     """
+    import time
     out = []
     for session_name in ("FP1", "FP2", "FP3"):
+        laps = None
+        session = None
+        for attempt in range(max_retries + 1):
+            try:
+                session = fastf1.get_session(year, round_number, session_name)
+                session.load()
+                laps = session.laps
+                break
+            except Exception:
+                if attempt < max_retries:
+                    time.sleep(1.0)
+                else:
+                    laps = None
+        if laps is None or (hasattr(laps, "empty") and laps.empty):
+            continue
         try:
-            session = fastf1.get_session(year, round_number, session_name)
-            session.load()
-            laps = session.laps
-            if laps is None or laps.empty:
-                continue
             # Best lap per driver
             best = laps.dropna(subset=["LapTime"]).groupby("DriverNumber").agg(
                 LapTime=("LapTime", "min")
             ).reset_index()
             if best.empty:
                 continue
-            # Fastest in session
             fastest = best["LapTime"].min()
             if fastest is None or pd.isna(fastest):
                 continue
-            # Delta in seconds (timedelta -> float)
             def _to_sec(t):
                 if t is None or pd.isna(t):
                     return 0.0
@@ -77,7 +127,7 @@ def load_fp_deltas(year: int, round_number: int) -> pd.DataFrame:
                 return float(t)
             fastest_sec = _to_sec(fastest)
             best["delta_sec"] = best["LapTime"].apply(lambda x: _to_sec(x) - fastest_sec)
-            drivers = session.results
+            drivers = session.results if session is not None else None
             if drivers is not None and not drivers.empty and "Abbreviation" in drivers.columns:
                 best = best.merge(
                     drivers[["DriverNumber", "Abbreviation"]].drop_duplicates("DriverNumber"),
@@ -102,6 +152,38 @@ def load_fp_deltas(year: int, round_number: int) -> pd.DataFrame:
             how="outer",
         )
     return merged
+
+
+def load_race_tyre_proxy(year: int, round_number: int) -> pd.DataFrame:
+    """
+    Load race lap data and compute per-driver tyre proxy (e.g. avg laps per stint).
+    Returns DataFrame with Year, Round, Abbreviation, tyre_proxy (float). Empty on failure.
+    """
+    try:
+        session = fastf1.get_session(year, round_number, "R")
+        session.load()
+        laps = getattr(session, "laps", None)
+        if laps is None or (hasattr(laps, "empty") and laps.empty):
+            return pd.DataFrame()
+        if "Stint" not in laps.columns or "DriverNumber" not in laps.columns:
+            return pd.DataFrame()
+        stint_laps = laps.groupby(["DriverNumber", "Stint"]).size().reset_index(name="LapsInStint")
+        avg_per_driver = stint_laps.groupby("DriverNumber")["LapsInStint"].mean().reset_index()
+        avg_per_driver.columns = ["DriverNumber", "tyre_proxy"]
+        results = getattr(session, "results", None)
+        if results is not None and not results.empty and "Abbreviation" in results.columns:
+            avg_per_driver = avg_per_driver.merge(
+                results[["DriverNumber", "Abbreviation"]].drop_duplicates("DriverNumber"),
+                on="DriverNumber",
+                how="left",
+            )
+        else:
+            avg_per_driver["Abbreviation"] = avg_per_driver["DriverNumber"].astype(str)
+        avg_per_driver["Year"] = year
+        avg_per_driver["Round"] = round_number
+        return avg_per_driver[["Year", "Round", "Abbreviation", "tyre_proxy"]]
+    except Exception:
+        return pd.DataFrame()
 
 
 def load_qualifying_results(year: int, round_number: int) -> pd.DataFrame:

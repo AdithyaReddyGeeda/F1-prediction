@@ -15,7 +15,7 @@ _path = Path(__file__).resolve().parent.parent
 if str(_path) not in sys.path:
     sys.path.insert(0, str(_path))
 
-from config import get_manual_grid, GRID_2026
+from config import get_manual_grid, get_schedule_fallback, GRID_2026
 from data import enable_fastf1_cache, get_event_schedule, load_race_results
 from web_data import fetch_season_grid_from_web
 
@@ -34,6 +34,7 @@ def _ensure_cache():
 def safe_get_schedule(year: int, use_fallback_year: bool = False) -> pd.DataFrame:
     """
     Get event schedule for year. If use_fallback_year, try previous year when current fails/empty.
+    For 2026 (and future seasons), use config fallback when FastF1 returns empty.
     """
     _ensure_cache()
     try:
@@ -42,6 +43,10 @@ def safe_get_schedule(year: int, use_fallback_year: bool = False) -> pd.DataFram
             return df
     except Exception:
         pass
+    # Config fallback for 2026 / future when official calendar is in config
+    fallback = get_schedule_fallback(year)
+    if not fallback.empty:
+        return fallback
     if use_fallback_year and year > 2014:
         try:
             return get_event_schedule(year - 1)

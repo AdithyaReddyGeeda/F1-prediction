@@ -10,11 +10,18 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+try:
+    from config import ENGINE_BY_TEAM
+except ImportError:
+    ENGINE_BY_TEAM = {}
+
 # Defaults for rookies / missing data
 DEFAULT_AVG_POS = 12.0
 DEFAULT_TRACK_AVG = 10.0
 DEFAULT_SYNERGY = 10.0
 DNF_IMPUTE_POSITION = 21
+# For early DNF (<50% race laps) use 20 so model treats as "back of field"
+DNF_IMPUTE_EARLY_LAPS = 20
 
 # Circuit name -> type for track characteristic dummies (simplified mapping)
 CIRCUIT_TYPE_MAP = {
@@ -45,10 +52,17 @@ def _circuit_to_type(circuit: str) -> str:
 def impute_dnf_positions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Impute finish position for DNFs so target is usable.
-    Expects Position (numeric) and optional Status. Sets Position to DNF_IMPUTE_POSITION
-    when Status indicates DNF or Position is null/invalid.
+    - If Laps and RaceLaps exist: impute DNF_IMPUTE_EARLY_LAPS (20) when Laps < 50% of RaceLaps.
+    - If Status indicates DNF or Position is null/invalid: impute DNF_IMPUTE_POSITION (21).
     """
     df = df.copy()
+    # Laps-based: <50% race distance (when FastF1 provides Laps/RaceLaps) -> impute 20
+    if "Laps" in df.columns and "RaceLaps" in df.columns:
+        race_laps = df["RaceLaps"].max()
+        if race_laps and race_laps > 0:
+            laps_ok = df["Laps"].notna()
+            early_dnf = laps_ok & (df["Laps"].astype(float) < 0.5 * float(race_laps))
+            df.loc[early_dnf, "Position"] = DNF_IMPUTE_EARLY_LAPS
     if "Status" in df.columns:
         # Common DNF-like statuses (FastF1 may use various strings)
         dnf_flags = df["Status"].astype(str).str.upper().str.contains(
@@ -58,7 +72,7 @@ def impute_dnf_positions(df: pd.DataFrame) -> pd.DataFrame:
         )
         mask = dnf_flags & (df["Position"].isna() | (df["Position"] < 1) | (df["Position"] > 22))
         df.loc[mask, "Position"] = DNF_IMPUTE_POSITION
-    # Any remaining null/invalid positions (no Status) -> impute
+    # Any remaining null/invalid positions -> impute
     bad = df["Position"].isna() | (df["Position"] < 1) | (df["Position"] > 22)
     df.loc[bad, "Position"] = DNF_IMPUTE_POSITION
     return df
@@ -322,6 +336,7 @@ def build_race_feature_df(
     quali_df: Optional[pd.DataFrame] = None,
     weather_per_race: Optional[dict] = None,
     fp_df: Optional[pd.DataFrame] = None,
+    tyre_proxy_df: Optional[pd.DataFrame] = None,
     ewma_alpha: float = 0.4,
     default_avg_pos: float = DEFAULT_AVG_POS,
 ) -> pd.DataFrame:
@@ -335,6 +350,9 @@ def build_race_feature_df(
     df = race_df.dropna(subset=["Position", "Abbreviation"]).copy()
     df = df.sort_values(["Year", "Round"])
     df = impute_dnf_positions(df)
+
+    # Engine supplier from team (for categorical feature)
+    df["engine_supplier"] = df["TeamName"].map(ENGINE_BY_TEAM).fillna("Other").astype(str)
 
     # Grid position: previous round finish or 10
     df["GridPosition"] = 10.0
@@ -370,10 +388,20 @@ def build_race_feature_df(
         df, last_n=10, position_col="Position", status_col="Status" if "Status" in df.columns else None
     ).values
 
-    # Tyre degradation proxies: circuit abrasion, tyre life penalty (default 0.5), driver tyre management placeholder
+    # Tyre degradation proxies: circuit abrasion, tyre life penalty (default 0.5), driver tyre from stint data when available
     df["circuit_abrasion_proxy"] = df["Circuit"].map(get_circuit_abrasion_proxy).values
     df["tyre_life_penalty_proxy"] = get_tyre_life_penalty_proxy(0.5)
-    df["driver_tyre_management_proxy"] = 0.0  # placeholder; can be filled from stint data later
+    df["driver_tyre_management_proxy"] = 0.0
+    if tyre_proxy_df is not None and not tyre_proxy_df.empty and "tyre_proxy" in tyre_proxy_df.columns:
+        df = df.merge(
+            tyre_proxy_df[["Year", "Round", "Abbreviation", "tyre_proxy"]].drop_duplicates(
+                subset=["Year", "Round", "Abbreviation"], keep="last"
+            ),
+            on=["Year", "Round", "Abbreviation"],
+            how="left",
+        )
+        df["driver_tyre_management_proxy"] = df["tyre_proxy"].fillna(0.0).values
+        df = df.drop(columns=["tyre_proxy"], errors="ignore")
 
     # Interaction: form * teammate_delta (captures under/overperformance vs teammate)
     df["form_x_teammate_delta"] = (df["RecentForm"].astype(float) * df["teammate_delta"].astype(float)).values
