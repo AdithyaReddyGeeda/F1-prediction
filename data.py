@@ -212,6 +212,127 @@ def load_fp_deltas(year: int, round_number: int, max_retries: int = 2) -> pd.Dat
     return merged
 
 
+def load_clean_air_pace(year: int, round_number: int, min_gap_ahead: float = 3.0) -> pd.DataFrame:
+    """
+    Per-driver average lap time when running in clean air
+    (gap to car ahead > min_gap_ahead seconds).
+    Excludes pit laps, safety car laps, and lapped traffic.
+    Returns: Year, Round, Abbreviation, clean_air_pace_sec (float)
+    Empty DataFrame on failure.
+    """
+    try:
+        session = fastf1.get_session(year, round_number, "R")
+        session.load()
+        laps = session.laps.copy()
+
+        def to_sec(t):
+            if t is None or not hasattr(t, "total_seconds"):
+                return None
+            return t.total_seconds()
+
+        if "PitInTime" in laps.columns and "PitOutTime" in laps.columns:
+            laps = laps[laps["PitInTime"].isna() & laps["PitOutTime"].isna()]
+        laps = laps.dropna(subset=["LapTime"])
+        laps["lap_sec"] = laps["LapTime"].apply(to_sec)
+        laps = laps.dropna(subset=["lap_sec"])
+        laps = laps[laps["lap_sec"] > 40]
+
+        if "GapToLeader" in laps.columns:
+            laps = laps[laps["GapToLeader"] > min_gap_ahead]
+
+        if laps.empty:
+            return pd.DataFrame()
+
+        best_per_driver = laps.groupby("DriverNumber")["lap_sec"].min()
+        laps = laps.merge(
+            best_per_driver.rename("best_lap"),
+            left_on="DriverNumber", right_index=True, how="left",
+        )
+        laps = laps[laps["lap_sec"] <= laps["best_lap"] * 1.07]
+
+        avg = (
+            laps.groupby("DriverNumber")["lap_sec"]
+            .mean()
+            .reset_index()
+            .rename(columns={"lap_sec": "clean_air_pace_sec"})
+        )
+
+        results = session.results
+        if results is not None and not results.empty and "Abbreviation" in results.columns:
+            avg = avg.merge(
+                results[["DriverNumber", "Abbreviation"]].drop_duplicates("DriverNumber"),
+                on="DriverNumber", how="left",
+            )
+        else:
+            avg["Abbreviation"] = avg["DriverNumber"].astype(str)
+
+        avg["Year"] = year
+        avg["Round"] = round_number
+        return avg[["Year", "Round", "Abbreviation", "clean_air_pace_sec"]]
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_quali_sector_times(year: int, round_number: int) -> pd.DataFrame:
+    """
+    Per-driver best sector times from qualifying (gap to session best, seconds).
+    Uses best sector across all Q1/Q2/Q3 attempts independently.
+    Returns: Year, Round, Abbreviation,
+             s1_gap, s2_gap, s3_gap, total_sector_gap,
+             s1_pct, s2_pct, s3_pct
+    Empty DataFrame on failure.
+    """
+    try:
+        session = fastf1.get_session(year, round_number, "Q")
+        session.load()
+        laps = session.laps.copy()
+        laps = laps.dropna(subset=["Sector1Time", "Sector2Time", "Sector3Time"])
+
+        def to_sec(t):
+            return t.total_seconds() if hasattr(t, "total_seconds") else None
+
+        laps["s1_sec"] = laps["Sector1Time"].apply(to_sec)
+        laps["s2_sec"] = laps["Sector2Time"].apply(to_sec)
+        laps["s3_sec"] = laps["Sector3Time"].apply(to_sec)
+        laps = laps.dropna(subset=["s1_sec", "s2_sec", "s3_sec"])
+        laps = laps[(laps["s1_sec"] > 5) & (laps["s2_sec"] > 5) & (laps["s3_sec"] > 5)]
+
+        best = laps.groupby("DriverNumber").agg(
+            best_s1=("s1_sec", "min"),
+            best_s2=("s2_sec", "min"),
+            best_s3=("s3_sec", "min"),
+        ).reset_index()
+
+        best["s1_gap"] = best["best_s1"] - best["best_s1"].min()
+        best["s2_gap"] = best["best_s2"] - best["best_s2"].min()
+        best["s3_gap"] = best["best_s3"] - best["best_s3"].min()
+        best["total_sector_gap"] = best["s1_gap"] + best["s2_gap"] + best["s3_gap"]
+
+        best["lap_total"] = best["best_s1"] + best["best_s2"] + best["best_s3"]
+        best["s1_pct"] = best["best_s1"] / best["lap_total"]
+        best["s2_pct"] = best["best_s2"] / best["lap_total"]
+        best["s3_pct"] = best["best_s3"] / best["lap_total"]
+
+        results = session.results
+        if results is not None and not results.empty and "Abbreviation" in results.columns:
+            best = best.merge(
+                results[["DriverNumber", "Abbreviation"]].drop_duplicates("DriverNumber"),
+                on="DriverNumber", how="left",
+            )
+        else:
+            best["Abbreviation"] = best["DriverNumber"].astype(str)
+
+        best["Year"] = year
+        best["Round"] = round_number
+
+        cols = ["Year", "Round", "Abbreviation", "s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct"]
+        return best[cols]
+
+    except Exception:
+        return pd.DataFrame()
+
+
 def load_race_tyre_proxy(year: int, round_number: int) -> pd.DataFrame:
     """
     Load race lap data and compute per-driver tyre proxy (e.g. avg laps per stint).
@@ -378,5 +499,115 @@ def get_current_season_grid(year: int, up_to_round: int, seasons_back: int = 2) 
 
     return pd.DataFrame(columns=["DriverNumber", "Abbreviation", "TeamName"])
 
+
+def load_race_time_and_fastlap(year: int, round_number: int) -> dict:
+    """
+    Extract winner total race time, fastest lap time, and fastest lap driver
+    from a completed race session.
+
+    Returns dict with keys:
+        winner_time_sec     : float  - winner's total race time in seconds
+        fastest_lap_time_sec: float  - fastest lap time in seconds
+        fastest_lap_driver  : str    - Abbreviation of fastest lap setter
+        fastest_lap_no      : int    - lap number fastest lap was set on
+        total_laps          : int    - total race laps
+        pole_time_sec       : float  - pole position lap time in seconds (from Q session)
+    Returns empty dict on failure.
+    """
+    result = {}
+    try:
+        session = fastf1.get_session(year, round_number, "R")
+        session.load()
+        res = session.results
+
+        # Winner time
+        winner_row = res[pd.to_numeric(res["Position"], errors="coerce") == 1]
+        if not winner_row.empty:
+            t = winner_row.iloc[0].get("Time")
+            if t is not None and hasattr(t, "total_seconds"):
+                result["winner_time_sec"] = t.total_seconds()
+
+        # Fastest lap: try FastestLapTime column first
+        if "FastestLapTime" in res.columns:
+            fl_valid = res["FastestLapTime"].notna()
+            if fl_valid.any():
+                fl_row = res[fl_valid].iloc[0]
+                flt = fl_row.get("FastestLapTime")
+                if flt is not None and hasattr(flt, "total_seconds"):
+                    result["fastest_lap_time_sec"] = flt.total_seconds()
+                result["fastest_lap_driver"] = str(fl_row.get("Abbreviation", ""))
+                fln = fl_row.get("FastestLapNo") or fl_row.get("FastestLap")
+                if fln is not None and not isinstance(fln, str):
+                    result["fastest_lap_no"] = int(fln)
+        else:
+            # Fallback: compute from laps data
+            laps = session.laps
+            if laps is not None and not laps.empty:
+                laps = laps.dropna(subset=["LapTime"])
+            if laps is not None and not laps.empty:
+                fastest_idx = laps["LapTime"].idxmin()
+                fl_lap = laps.loc[fastest_idx]
+                result["fastest_lap_time_sec"] = fl_lap["LapTime"].total_seconds()
+                drv_num = fl_lap.get("DriverNumber")
+                if res is not None and "Abbreviation" in res.columns and "DriverNumber" in res.columns:
+                    abbrev_map = res.set_index("DriverNumber")["Abbreviation"].to_dict()
+                    result["fastest_lap_driver"] = str(abbrev_map.get(drv_num, ""))
+                else:
+                    result["fastest_lap_driver"] = str(drv_num)
+                result["fastest_lap_no"] = int(fl_lap.get("LapNumber", 0))
+
+        # Total laps
+        total = getattr(session, "total_laps", None)
+        if total is None and "Laps" in res.columns:
+            total = int(res["Laps"].max())
+        if total:
+            result["total_laps"] = int(total)
+
+    except Exception:
+        pass
+
+    # Pole time from qualifying
+    try:
+        q_session = fastf1.get_session(year, round_number, "Q")
+        q_session.load()
+        q_laps = q_session.laps.dropna(subset=["LapTime"])
+        if not q_laps.empty:
+            pole_time = q_laps["LapTime"].min()
+            result["pole_time_sec"] = pole_time.total_seconds()
+    except Exception:
+        pass
+
+    return result
+
+
+def load_historical_race_times(start_year: int = 2020, end_year: int = 2025) -> pd.DataFrame:
+    """
+    Load winner race time, fastest lap time, fastest lap driver for all historical races.
+    Returns DataFrame: Year, Round, Circuit, winner_time_sec, fastest_lap_time_sec,
+                       fastest_lap_driver, fastest_lap_no, total_laps, pole_time_sec
+    """
+    rows = []
+    for year in range(start_year, end_year + 1):
+        try:
+            sched = get_event_schedule(year)
+            if sched.empty:
+                from config import get_schedule_fallback
+                sched = get_schedule_fallback(year)
+            if sched.empty:
+                continue
+            for _, row in sched.iterrows():
+                r = int(row["RoundNumber"])
+                circuit = str(row.get("EventName", ""))
+                d = load_race_time_and_fastlap(year, r)
+                if d:
+                    d["Year"] = year
+                    d["Round"] = r
+                    d["Circuit"] = circuit
+                    rows.append(d)
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 

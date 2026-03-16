@@ -60,6 +60,34 @@ ENGINE_BY_TEAM: Dict[str, str] = {
     "Cadillac": "Cadillac",
 }
 
+# Circuit metadata: laps and track length (km) for each 2026 event.
+# Used to estimate total race distance and time for future races.
+CIRCUIT_METADATA: dict = {
+    "Australian Grand Prix":    {"laps": 58, "length_km": 5.278},
+    "Chinese Grand Prix":       {"laps": 56, "length_km": 5.451},
+    "Bahrain Grand Prix":       {"laps": 57, "length_km": 5.412},
+    "Saudi Arabian Grand Prix": {"laps": 50, "length_km": 6.174},
+    "Miami Grand Prix":         {"laps": 57, "length_km": 5.412},
+    "Emilia Romagna Grand Prix": {"laps": 63, "length_km": 4.909},
+    "Monaco Grand Prix":        {"laps": 78, "length_km": 3.337},
+    "Spanish Grand Prix":       {"laps": 66, "length_km": 4.657},
+    "Canadian Grand Prix":      {"laps": 70, "length_km": 4.361},
+    "Austrian Grand Prix":      {"laps": 71, "length_km": 4.318},
+    "British Grand Prix":       {"laps": 52, "length_km": 5.891},
+    "Belgian Grand Prix":       {"laps": 44, "length_km": 7.004},
+    "Hungarian Grand Prix":     {"laps": 70, "length_km": 4.381},
+    "Dutch Grand Prix":         {"laps": 72, "length_km": 4.259},
+    "Italian Grand Prix":       {"laps": 53, "length_km": 5.793},
+    "Azerbaijan Grand Prix":    {"laps": 51, "length_km": 6.003},
+    "Singapore Grand Prix":     {"laps": 62, "length_km": 4.940},
+    "United States Grand Prix": {"laps": 56, "length_km": 5.513},
+    "Mexico City Grand Prix":   {"laps": 71, "length_km": 4.304},
+    "São Paulo Grand Prix":     {"laps": 71, "length_km": 4.309},
+    "Las Vegas Grand Prix":     {"laps": 50, "length_km": 6.201},
+    "Qatar Grand Prix":         {"laps": 57, "length_km": 5.380},
+    "Abu Dhabi Grand Prix":     {"laps": 58, "length_km": 5.281},
+}
+
 # --- 2026 schedule fallback (race day = Sunday). Replace when official calendar is published. ---
 # Format: RoundNumber, EventName, EventDate, Country
 SCHEDULE_2026: List[dict] = [

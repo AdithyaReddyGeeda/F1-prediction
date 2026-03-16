@@ -398,6 +398,8 @@ def build_race_feature_df(
     weather_per_race: Optional[dict] = None,
     fp_df: Optional[pd.DataFrame] = None,
     tyre_proxy_df: Optional[pd.DataFrame] = None,
+    cap_df: Optional[pd.DataFrame] = None,
+    sector_df: Optional[pd.DataFrame] = None,
     ewma_alpha: float = 0.4,
     default_avg_pos: float = DEFAULT_AVG_POS,
 ) -> pd.DataFrame:
@@ -533,5 +535,44 @@ def build_race_feature_df(
     # Interaction and rain flag
     df["is_rain"] = (df["Weather"] == "Rain").astype(float)
     df["grid_pos_x_rain"] = df["GridPosition"] * df["is_rain"]
+
+    # ── Clean air pace ──────────────────────────────────────────────
+    if cap_df is not None and not cap_df.empty and "clean_air_pace_sec" in cap_df.columns:
+        df = df.merge(
+            cap_df[["Year", "Round", "Abbreviation", "clean_air_pace_sec"]]
+            .drop_duplicates(subset=["Year", "Round", "Abbreviation"], keep="last"),
+            on=["Year", "Round", "Abbreviation"],
+            how="left",
+        )
+        circuit_median_cap = df.groupby("Circuit")["clean_air_pace_sec"].transform("median")
+        df["clean_air_pace_sec"] = df["clean_air_pace_sec"].fillna(circuit_median_cap)
+        df["clean_air_pace_sec"] = df["clean_air_pace_sec"].fillna(df["clean_air_pace_sec"].median())
+    else:
+        df["clean_air_pace_sec"] = 0.0
+
+    # ── Qualifying sector times ──────────────────────────────────────
+    sector_cols = ["s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct"]
+    if sector_df is not None and not sector_df.empty:
+        have_sector = [c for c in sector_cols if c in sector_df.columns]
+        if have_sector:
+            df = df.merge(
+                sector_df[["Year", "Round", "Abbreviation"] + have_sector]
+                .drop_duplicates(subset=["Year", "Round", "Abbreviation"], keep="last"),
+                on=["Year", "Round", "Abbreviation"],
+                how="left",
+            )
+            for col in sector_cols:
+                if col in df.columns:
+                    circuit_med = df.groupby("Circuit")[col].transform("median")
+                    df[col] = df[col].fillna(circuit_med)
+                    df[col] = df[col].fillna(df[col].median() if df[col].notna().any() else 0.0)
+                else:
+                    df[col] = 0.0
+        else:
+            for col in sector_cols:
+                df[col] = 0.0
+    else:
+        for col in sector_cols:
+            df[col] = 0.0
 
     return df

@@ -18,10 +18,11 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import GRID_2026
+from config import GRID_2026, CIRCUIT_METADATA
 from inference import predict_finishing_order, get_inference_warnings
 from quali_inference import predict_quali_order
-from data import enable_fastf1_cache, get_event_schedule, load_race_results
+from data import enable_fastf1_cache, get_event_schedule, load_race_results, load_race_time_and_fastlap
+from time_inference import predict_race_time, predict_fastest_lap
 from utils.data_fetch import safe_get_drivers, safe_get_schedule
 from utils.circuit_geo import get_circuit_track_data
 
@@ -47,6 +48,17 @@ TEAM_NAME_ALIASES = {
 
 def normalize_team_name(name: str) -> str:
     return TEAM_NAME_ALIASES.get(str(name).strip(), str(name).strip())
+
+
+def _sec_to_str(sec: float, include_hours: bool = True) -> str:
+    """Format seconds as H:MM:SS.mmm or M:SS.mmm."""
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    if include_hours:
+        return f"{h}:{m:02d}:{s:06.3f}"
+    return f"{m}:{s:06.3f}"
 
 
 @st.cache_data(ttl=600)
@@ -628,6 +640,97 @@ F1 data via FastF1 API<br>Model: XGBoost · MAE ~6 pos
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+                # ── Race time and fastest lap predictions ──────────────────────────
+                st.markdown("---")
+                st.markdown("### ⏱️ Race Time & Fastest Lap")
+                circuit_meta = CIRCUIT_METADATA.get(event_name, {})
+                total_laps_est = circuit_meta.get("laps", 60)
+                pole_time_sec = None
+                try:
+                    fl_live = load_race_time_and_fastlap(year, round_number)
+                    if fl_live.get("pole_time_sec"):
+                        pole_time_sec = fl_live["pole_time_sec"]
+                except Exception:
+                    pass
+
+                col_time, col_fl = st.columns(2)
+                with col_time:
+                    st.markdown("#### 🏁 Predicted Race Duration")
+                    time_pred = predict_race_time(
+                        circuit=event_name,
+                        total_laps=total_laps_est,
+                        pole_time_sec=pole_time_sec,
+                        weather_str=weather_str,
+                    )
+                    if time_pred:
+                        length_km = circuit_meta.get("length_km", "?")
+                        total_km = round(total_laps_est * (length_km if isinstance(length_km, (int, float)) else 5), 1)
+                        st.markdown(f"""
+                        <div style='background:#1a1a1a; border-left:4px solid #e10600;
+                                    border-radius:6px; padding:1rem;'>
+                            <div style='font-size:2rem; font-weight:bold; color:#fff;'>
+                                {time_pred.get("predicted_str", "—")}
+                            </div>
+                            <div style='color:#888; font-size:0.85rem; margin-top:4px;'>
+                                Range: {_sec_to_str(time_pred.get("low_sec", 0))}
+                                — {_sec_to_str(time_pred.get("high_sec", 0))}
+                            </div>
+                            <div style='color:#555; font-size:0.75rem; margin-top:4px;'>
+                                {total_laps_est} laps ·
+                                {length_km} km/lap ·
+                                {total_km} km total
+                                · via {time_pred.get("method", "—")}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if weather_str != "Dry":
+                            pct = "13" if weather_str == "Rain" else "7"
+                            st.caption(f"⚠️ {weather_str} conditions — estimate includes ~{pct}% pace reduction")
+                    else:
+                        st.info("Pole time not yet available — run Qualifying prediction first for better estimate.")
+
+                with col_fl:
+                    st.markdown("#### ⚡ Predicted Fastest Lap")
+                    fl_pred = predict_fastest_lap(
+                        circuit=event_name,
+                        grid_df=grid_df,
+                        pole_time_sec=pole_time_sec,
+                        weather_str=weather_str,
+                    )
+                    fl_time_str = "—"
+                    if fl_pred:
+                        fl_driver = fl_pred.get("driver", "—")
+                        fl_name = fl_pred.get("driver_name", fl_driver)
+                        fl_time_str = fl_pred.get("predicted_time_str", "—")
+                        fl_probs = fl_pred.get("probabilities", {})
+                        st.markdown(f"""
+                        <div style='background:#1a1a1a; border-left:4px solid #ffd700;
+                                    border-radius:6px; padding:1rem;'>
+                            <div style='font-size:1.4rem; font-weight:bold; color:#ffd700;'>
+                                {fl_name}
+                            </div>
+                            <div style='font-size:1.8rem; font-weight:bold; color:#fff; margin-top:4px;'>
+                                {fl_time_str}
+                            </div>
+                            <div style='color:#555; font-size:0.75rem; margin-top:4px;'>
+                                via {fl_pred.get("method", "—")}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if fl_probs:
+                            st.markdown("**Top 5 probabilities:**")
+                            for drv, prob in list(fl_probs.items())[:5]:
+                                bar_pct = int(prob * 100)
+                                st.markdown(f"""
+                                <div style='display:flex; align-items:center; gap:8px; margin:3px 0;'>
+                                    <span style='color:#fff; width:40px; font-size:0.85rem;'>{drv}</span>
+                                    <div style='background:#333; border-radius:3px; height:16px; flex:1;'>
+                                        <div style='background:#e10600; height:100%; width:{bar_pct}%;
+                                                    border-radius:3px;'></div>
+                                    </div>
+                                    <span style='color:#aaa; font-size:0.8rem; width:35px;'>{bar_pct}%</span>
+                                </div>""", unsafe_allow_html=True)
+
             today = dt.date.today()
             if "EventDate" in schedule_df.columns:
                 schedule_df["EventDate"] = pd.to_datetime(schedule_df["EventDate"]).dt.date
@@ -682,6 +785,33 @@ F1 data via FastF1 API<br>Model: XGBoost · MAE ~6 pos
                             mime="text/csv",
                             key="dl_pred_actual",
                         )
+                        # Actual vs predicted for race time and fastest lap
+                        try:
+                            actual_tfl = load_race_time_and_fastlap(year, round_number)
+                            if actual_tfl and (time_pred or fl_pred):
+                                st.markdown("**Actual vs Predicted (Race Time & Fastest Lap):**")
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    actual_time = actual_tfl.get("winner_time_sec")
+                                    if actual_time is not None and time_pred:
+                                        err_s = abs(actual_time - time_pred["predicted_sec"])
+                                        st.metric(
+                                            "Race time error",
+                                            f"{err_s:.1f}s",
+                                            delta=f"Predicted: {time_pred['predicted_str']} · Actual: {_sec_to_str(actual_time)}"
+                                        )
+                                with c2:
+                                    actual_fl_driver = actual_tfl.get("fastest_lap_driver", "")
+                                    actual_fl_time = actual_tfl.get("fastest_lap_time_sec")
+                                    correct = "✅" if actual_fl_driver == fl_pred.get("driver") else "❌"
+                                    if actual_fl_time is not None:
+                                        st.metric(
+                                            f"Fastest lap {correct}",
+                                            actual_fl_driver,
+                                            delta=f"Time: {_sec_to_str(actual_fl_time, False)} · Predicted: {fl_time_str}"
+                                        )
+                        except Exception:
+                            pass
                 except Exception as e:
                     days_since = (today - pd.to_datetime(event_dates.iloc[0]).date()).days if not event_dates.empty else 99
                     if days_since == 0:

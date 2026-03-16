@@ -13,7 +13,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import GRID_2026, ROOKIE_DEFAULT_AVG_POSITION, ENGINE_BY_TEAM
+from config import GRID_2026, ROOKIE_DEFAULT_AVG_POSITION, ENGINE_BY_TEAM, CIRCUIT_METADATA
 from utils.race_features import (
     build_race_feature_df,
     DEFAULT_TRACK_AVG,
@@ -144,6 +144,62 @@ def load_historical_tyre_proxy(start_year: int = 2020, end_year: int = 2025) -> 
     return pd.concat(rows, ignore_index=True)
 
 
+def load_historical_clean_air_pace(start_year: int = 2020, end_year: int = 2025) -> pd.DataFrame:
+    """Load clean air race pace for all races. Same pattern as load_historical_fp_deltas."""
+    from data import get_event_schedule, load_clean_air_pace
+    import fastf1
+    cache_dir = ROOT / "fastf1_cache"
+    cache_dir.mkdir(exist_ok=True)
+    fastf1.Cache.enable_cache(cache_dir)
+    rows = []
+    for year in range(start_year, end_year + 1):
+        try:
+            sched = get_event_schedule(year)
+            if sched.empty:
+                continue
+            for _, row in sched.iterrows():
+                r = int(row["RoundNumber"])
+                try:
+                    df = load_clean_air_pace(year, r)
+                    if not df.empty:
+                        rows.append(df)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+def load_historical_sector_times(start_year: int = 2020, end_year: int = 2025) -> pd.DataFrame:
+    """Load qualifying sector times for all races."""
+    from data import get_event_schedule, load_quali_sector_times
+    import fastf1
+    cache_dir = ROOT / "fastf1_cache"
+    cache_dir.mkdir(exist_ok=True)
+    fastf1.Cache.enable_cache(cache_dir)
+    rows = []
+    for year in range(start_year, end_year + 1):
+        try:
+            sched = get_event_schedule(year)
+            if sched.empty:
+                continue
+            for _, row in sched.iterrows():
+                r = int(row["RoundNumber"])
+                try:
+                    df = load_quali_sector_times(year, r)
+                    if not df.empty:
+                        rows.append(df)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
 def load_historical_quali_gaps(start_year: int = 2020, end_year: int = 2025) -> pd.DataFrame:
     """Load quali gap to pole (seconds) for all races. Returns Year, Round, Abbreviation, quali_gap_to_pole."""
     from data import get_event_schedule, load_quali_gaps
@@ -239,6 +295,8 @@ def main():
         weather_per_race = c1["weather_per_race"]
         start_year = c1["start_year"]
         end_year = c1["end_year"]
+        cap_df = c1.get("cap_df")
+        sector_df = c1.get("sector_df")
         print("Resumed from checkpoint 1 (seasons {}-{}). Skipping data load.".format(start_year, end_year))
     else:
         print("Training on seasons {}-{} (FastF1 limit 500 calls/h; fewer years = fewer calls).".format(start_year, end_year))
@@ -268,6 +326,20 @@ def main():
         if quali_gap_df.empty:
             quali_gap_df = None
 
+        print("Loading clean air race pace (per-driver pace in clear traffic)...")
+        cap_df = load_historical_clean_air_pace(start_year, end_year)
+        if cap_df.empty:
+            cap_df = None
+        else:
+            print("  Loaded {} driver-race clean air pace entries".format(len(cap_df)))
+
+        print("Loading qualifying sector times (S1/S2/S3 gaps to best)...")
+        sector_df = load_historical_sector_times(start_year, end_year)
+        if sector_df.empty:
+            sector_df = None
+        else:
+            print("  Loaded {} driver-race sector time entries".format(len(sector_df)))
+
         rng = np.random.default_rng(42)
         keys = race_df[["Year", "Round"]].drop_duplicates()
         weather_per_race = {}
@@ -284,6 +356,7 @@ def main():
         joblib.dump({
             "race_df": race_df, "quali_df": quali_df, "fp_df": fp_df, "tyre_proxy_df": tyre_proxy_df,
             "quali_gap_df": quali_gap_df, "weather_per_race": weather_per_race, "start_year": start_year, "end_year": end_year,
+            "cap_df": cap_df, "sector_df": sector_df,
         }, ckpt_1)
         print("Checkpoint 1 saved (data load complete).")
     rng = np.random.default_rng(42)
@@ -298,6 +371,8 @@ def main():
                 weather_per_race=weather_per_race,
                 fp_df=fp_df,
                 tyre_proxy_df=tyre_proxy_df,
+                cap_df=cap_df,
+                sector_df=sector_df,
                 ewma_alpha=alpha,
         )
         X_alpha = oversample_wet_rain(X_alpha, target_min_pct=0.25, rng=rng)
@@ -338,6 +413,7 @@ def main():
             "constructor_dnf_rate_at_circuit", "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
             "form_x_teammate_delta", "momentum", "driver_rain_delta",
             "FP1_delta", "FP2_delta", "FP3_delta",
+            "clean_air_pace_sec", "s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct",
             "driver_enc", "team_enc", "engine_enc", "circuit_enc",
             "circuit_type_street", "circuit_type_high_speed", "circuit_type_technical",
             "weather_Dry", "weather_Wet", "weather_Rain", "grid_pos_x_rain",
@@ -347,6 +423,10 @@ def main():
         for c in feat_cols_alpha:
             if c not in X_alpha.columns:
                 if c == "constructor_dnf_rate_at_circuit":
+                    X_alpha[c] = 0.0
+                elif c == "clean_air_pace_sec":
+                    X_alpha[c] = 88.0
+                elif c in ("s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct"):
                     X_alpha[c] = 0.0
                 else:
                     X_alpha[c] = 0.0 if "enc" in c or "weather" in c or "circuit_type" in c else (10.0 if "track" in c or "synergy" in c or "Constructor" in c or "Quali" in c or "Grid" in c else 0.0)
@@ -386,6 +466,8 @@ def main():
         weather_per_race=weather_per_race,
         fp_df=fp_df,
         tyre_proxy_df=tyre_proxy_df,
+        cap_df=cap_df,
+        sector_df=sector_df,
         ewma_alpha=best_alpha,
     )
     if quali_gap_df is not None and not quali_gap_df.empty:
@@ -430,11 +512,14 @@ def main():
     
     # Feature columns (order must match inference); include engine_enc, tyre, driver_dnf, practice deltas, quali_gap, circuit DNF
     feat_cols = [
-    "GridPosition", "QualiPosition", "quali_gap_to_pole", "RecentForm", "ConstructorEwma",
-    "track_avg_driver", "track_avg_team", "driver_team_synergy", "teammate_delta", "constructor_dnf_rate",
-    "constructor_dnf_rate_at_circuit", "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
-    "form_x_teammate_delta", "momentum", "driver_rain_delta",
+        "GridPosition", "QualiPosition", "quali_gap_to_pole", "RecentForm", "ConstructorEwma",
+        "track_avg_driver", "track_avg_team", "driver_team_synergy", "teammate_delta", "constructor_dnf_rate",
+        "constructor_dnf_rate_at_circuit", "driver_dnf_rate", "circuit_abrasion_proxy", "tyre_life_penalty_proxy", "driver_tyre_management_proxy",
+        "form_x_teammate_delta", "momentum", "driver_rain_delta",
         "FP1_delta", "FP2_delta", "FP3_delta",
+        "clean_air_pace_sec",
+        "s1_gap", "s2_gap", "s3_gap", "total_sector_gap",
+        "s1_pct", "s2_pct", "s3_pct",
         "driver_enc", "team_enc", "engine_enc", "circuit_enc",
         "circuit_type_street", "circuit_type_high_speed", "circuit_type_technical",
         "weather_Dry", "weather_Wet", "weather_Rain", "grid_pos_x_rain",
@@ -445,6 +530,10 @@ def main():
             if c == "quali_gap_to_pole":
                 X_df[c] = 2.0
             elif c == "constructor_dnf_rate_at_circuit":
+                X_df[c] = 0.0
+            elif c == "clean_air_pace_sec":
+                X_df[c] = 88.0
+            elif c in ("s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct"):
                 X_df[c] = 0.0
             else:
                 X_df[c] = 0.0 if "enc" in c or "weather" in c or "circuit_type" in c else (10.0 if "track" in c or "synergy" in c or "Constructor" in c or "Quali" in c or "Grid" in c else 0.0)
@@ -493,7 +582,25 @@ def main():
     driver_team_synergy_map = train_df.groupby(["Abbreviation", "TeamName"])["driver_team_synergy"].mean().to_dict()
     driver_rain_delta_map = train_df.groupby("Abbreviation")["driver_rain_delta"].mean().to_dict()
     circuit_dnf_rate_map = train_df.groupby(["TeamName", "Circuit"])["constructor_dnf_rate_at_circuit"].mean().to_dict()
-    
+
+    cap_map = {}
+    if cap_df is not None and not cap_df.empty:
+        merged_cap = train_df.merge(cap_df, on=["Year", "Round", "Abbreviation"], how="left")
+        cap_map = merged_cap.groupby("Abbreviation")["clean_air_pace_sec"].mean().dropna().to_dict()
+
+    circuit_cap_map = {}
+    if cap_df is not None and not cap_df.empty:
+        merged_cap = train_df.merge(cap_df, on=["Year", "Round", "Abbreviation"], how="left")
+        circuit_cap_map = merged_cap.groupby("Circuit")["clean_air_pace_sec"].median().dropna().to_dict()
+
+    sector_map = {}
+    if sector_df is not None and not sector_df.empty:
+        merged_sec = train_df.merge(sector_df, on=["Year", "Round", "Abbreviation"], how="left")
+        for col in ["s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct"]:
+            if col in merged_sec.columns:
+                sector_map["{}_by_driver".format(col)] = merged_sec.groupby("Abbreviation")[col].mean().dropna().to_dict()
+                sector_map["{}_by_circuit".format(col)] = merged_sec.groupby("Circuit")[col].median().dropna().to_dict()
+
     joblib.dump({
         "X_df": X_df, "y": y, "enc_driver": enc_driver, "enc_team": enc_team, "enc_engine": enc_engine,
         "enc_circuit": enc_circuit, "enc_weather": enc_weather, "feat_cols": feat_cols, "feature_names": feature_names,
@@ -503,6 +610,7 @@ def main():
         "driver_team_synergy_map": driver_team_synergy_map, "driver_rain_delta_map": driver_rain_delta_map,
         "circuit_dnf_rate_map": circuit_dnf_rate_map, "grid_baseline_mae": grid_baseline_mae, "best_alpha": best_alpha,
         "start_year": start_year, "end_year": end_year,
+        "cap_map": cap_map, "circuit_cap_map": circuit_cap_map, "sector_map": sector_map,
     }, ckpt_3)
     print("Checkpoint 3 saved (features and splits).")
 
@@ -528,6 +636,9 @@ def main():
         driver_team_synergy_map = c3["driver_team_synergy_map"]
         driver_rain_delta_map = c3["driver_rain_delta_map"]
         circuit_dnf_rate_map = c3["circuit_dnf_rate_map"]
+        cap_map = c3.get("cap_map", {})
+        circuit_cap_map = c3.get("circuit_cap_map", {})
+        sector_map = c3.get("sector_map", {})
         grid_baseline_mae = c3["grid_baseline_mae"]
         best_alpha = c3["best_alpha"]
         skip_phase_4 = True
@@ -803,6 +914,9 @@ def main():
             "driver_team_synergy_map": driver_team_synergy_map,
             "driver_rain_delta_map": driver_rain_delta_map,
             "circuit_dnf_rate_map": circuit_dnf_rate_map,
+            "cap_map": cap_map,
+            "circuit_cap_map": circuit_cap_map,
+            "sector_map": sector_map,
             "DEFAULT_TRACK_AVG": DEFAULT_TRACK_AVG,
             "DEFAULT_SYNERGY": DEFAULT_SYNERGY,
             "scaler": scaler,
@@ -949,10 +1063,212 @@ def train_quali_model():
     print("Saved quali model to", models_dir)
 
 
+def train_race_time_model():
+    """
+    Train XGBoost regressor to predict winner's total race time in seconds.
+    Features: circuit_enc, total_laps, pole_time_sec, avg_winner_time_at_circuit,
+              sc_proxy (historical SC frequency proxy), weather_Dry/Wet/Rain
+    """
+    import joblib
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    from data import load_historical_race_times
+
+    print("\n--- Race time model ---")
+    df = load_historical_race_times(2020, 2025)
+    if df.empty or "winner_time_sec" not in df.columns:
+        print("No race time data available.")
+        return
+
+    df = df.dropna(subset=["winner_time_sec", "pole_time_sec", "total_laps"])
+    df = df[df["winner_time_sec"] > 3600]
+    df = df[df["winner_time_sec"] < 7200]
+    print("Training race time model on {} races...".format(len(df)))
+
+    avg_winner_time_map = df.groupby("Circuit")["winner_time_sec"].mean().to_dict()
+    sc_proxy_map = df.groupby("Circuit")["winner_time_sec"].std().fillna(60).to_dict()
+    max_std = max(sc_proxy_map.values()) if sc_proxy_map else 1
+    sc_proxy_map = {k: v / max_std for k, v in sc_proxy_map.items()}
+
+    rng = np.random.default_rng(42)
+    df["Weather"] = rng.choice(["Dry", "Wet", "Rain"], size=len(df), p=[0.65, 0.25, 0.10])
+
+    enc_circuit = LabelEncoder()
+    enc_circuit.fit(list(df["Circuit"].unique()) + list(CIRCUIT_METADATA.keys()))
+    df["circuit_enc"] = enc_circuit.transform(df["Circuit"].astype(str))
+    df["sc_proxy"] = df["Circuit"].map(sc_proxy_map).fillna(0.5)
+    df["avg_winner_time"] = df["Circuit"].map(avg_winner_time_map).fillna(df["winner_time_sec"].mean())
+
+    wo = pd.get_dummies(df["Weather"], prefix="weather")
+    for c in ["weather_Dry", "weather_Wet", "weather_Rain"]:
+        if c not in wo.columns:
+            wo[c] = 0
+    df = pd.concat([df, wo], axis=1)
+
+    feat_cols = [
+        "circuit_enc", "total_laps", "pole_time_sec",
+        "avg_winner_time", "sc_proxy",
+        "weather_Dry", "weather_Wet", "weather_Rain",
+    ]
+    X = df[feat_cols].values.astype(float)
+    y = df["winner_time_sec"].values.astype(float)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    train_m = df["Year"] <= 2023
+    val_m = df["Year"] == 2024
+    if val_m.sum() < 5:
+        val_m = df["Year"] >= 2024
+
+    try:
+        import xgboost as xgb
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror", n_estimators=300,
+            max_depth=4, learning_rate=0.05, random_state=42,
+        )
+        model.fit(X_scaled[train_m], y[train_m], eval_set=[(X_scaled[val_m], y[val_m])], verbose=False)
+        preds = model.predict(X_scaled[val_m])
+        mae = np.abs(preds - y[val_m]).mean()
+        print("Race time val MAE: {:.1f}s  ({:.2f} min)".format(mae, mae / 60))
+    except ImportError:
+        from sklearn.ensemble import GradientBoostingRegressor
+        model = GradientBoostingRegressor(n_estimators=200, max_depth=4, random_state=42)
+        model.fit(X_scaled[train_m], y[train_m])
+
+    out_dir = ROOT / "model_artifacts"
+    out_dir.mkdir(exist_ok=True)
+    joblib.dump(model, out_dir / "race_time_model.joblib")
+    joblib.dump({
+        "circuit": enc_circuit,
+        "scaler": scaler,
+        "avg_winner_time_map": avg_winner_time_map,
+        "sc_proxy_map": sc_proxy_map,
+        "feature_names": feat_cols,
+    }, out_dir / "race_time_encoders.joblib")
+    print("Saved race time model.")
+
+
+def train_fastest_lap_model():
+    """
+    Train FL time regressor (pole_time + circuit + weather) and build team FL rate map
+    for driver scoring at inference.
+    """
+    import joblib
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    from data import load_historical_race_times, load_race_time_and_fastlap, load_race_results, get_event_schedule
+
+    print("\n--- Fastest lap model ---")
+    df = load_historical_race_times(2020, 2025)
+    if df.empty or "fastest_lap_time_sec" not in df.columns:
+        print("No fastest lap data.")
+        return
+
+    df = df.dropna(subset=["fastest_lap_time_sec", "pole_time_sec"])
+    df = df[df["fastest_lap_time_sec"] > 50]
+    df = df[df["fastest_lap_time_sec"] < 200]
+    print("Training fastest lap time model on {} races...".format(len(df)))
+
+    df["fl_to_pole_ratio"] = df["fastest_lap_time_sec"] / df["pole_time_sec"]
+    print("Average FL/pole ratio: {:.4f} (expected ~0.983 in dry)".format(df["fl_to_pole_ratio"].mean()))
+
+    # Team fastest lap counts and visit counts per (team, circuit)
+    team_fl_counts = {}
+    team_visit_counts = {}
+    for year in range(2020, 2026):
+        try:
+            sched = get_event_schedule(year)
+            if sched.empty:
+                from config import get_schedule_fallback
+                sched = get_schedule_fallback(year)
+            if sched.empty:
+                continue
+            for _, row in sched.iterrows():
+                r = int(row["RoundNumber"])
+                circuit = str(row.get("EventName", ""))
+                fl_data = load_race_time_and_fastlap(year, r)
+                fl_driver = fl_data.get("fastest_lap_driver", "")
+                res = load_race_results(year, r)
+                # Count visits: each (TeamName, circuit) in this race
+                if not res.empty and "TeamName" in res.columns:
+                    for _, dr in res.iterrows():
+                        team = str(dr.get("TeamName", ""))
+                        if team:
+                            key = (team, circuit)
+                            team_visit_counts[key] = team_visit_counts.get(key, 0) + 1
+                if not fl_driver:
+                    continue
+                if not res.empty and "Abbreviation" in res.columns and "TeamName" in res.columns:
+                    team_row = res[res["Abbreviation"] == fl_driver]
+                    if not team_row.empty:
+                        team = str(team_row.iloc[0]["TeamName"])
+                        key = (team, circuit)
+                        team_fl_counts[key] = team_fl_counts.get(key, 0) + 1
+        except Exception:
+            continue
+
+    team_fl_rate_map = {}
+    for k in set(list(team_fl_counts.keys()) + list(team_visit_counts.keys())):
+        visits = max(team_visit_counts.get(k, 1), 1)
+        team_fl_rate_map[k] = team_fl_counts.get(k, 0) / visits
+
+    global_team_fl_rate = {}
+    for (team, _), rate in team_fl_rate_map.items():
+        global_team_fl_rate[team] = global_team_fl_rate.get(team, [])
+        global_team_fl_rate[team].append(rate)
+    global_team_fl_rate = {t: np.mean(v) for t, v in global_team_fl_rate.items()}
+
+    rng = np.random.default_rng(42)
+    df["Weather"] = rng.choice(["Dry", "Wet", "Rain"], size=len(df), p=[0.65, 0.25, 0.10])
+    enc_circuit = LabelEncoder()
+    enc_circuit.fit(list(df["Circuit"].unique()) + list(CIRCUIT_METADATA.keys()))
+    df["circuit_enc"] = enc_circuit.transform(df["Circuit"].astype(str))
+    wo = pd.get_dummies(df["Weather"], prefix="weather")
+    for c in ["weather_Dry", "weather_Wet", "weather_Rain"]:
+        if c not in wo.columns:
+            wo[c] = 0
+    df = pd.concat([df, wo], axis=1)
+
+    feat_cols = ["circuit_enc", "pole_time_sec", "weather_Dry", "weather_Wet", "weather_Rain"]
+    X = df[feat_cols].values.astype(float)
+    y = df["fastest_lap_time_sec"].values.astype(float)
+    scaler = StandardScaler()
+    X_sc = scaler.fit_transform(X)
+
+    try:
+        import xgboost as xgb
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror", n_estimators=200,
+            max_depth=3, learning_rate=0.05, random_state=42,
+        )
+        model.fit(X_sc, y)
+    except ImportError:
+        from sklearn.ensemble import GradientBoostingRegressor
+        model = GradientBoostingRegressor(n_estimators=150, max_depth=3, random_state=42)
+        model.fit(X_sc, y)
+
+    preds = model.predict(X_sc)
+    ratio_err = np.abs(preds / df["pole_time_sec"].values - 0.983).mean()
+    print("FL time model trained. Avg ratio error: {:.4f}".format(ratio_err))
+
+    out_dir = ROOT / "model_artifacts"
+    out_dir.mkdir(exist_ok=True)
+    joblib.dump(model, out_dir / "fastest_lap_model.joblib")
+    joblib.dump({
+        "circuit": enc_circuit,
+        "scaler": scaler,
+        "team_fl_rate_map": team_fl_rate_map,
+        "global_team_fl_rate": global_team_fl_rate,
+        "feature_names": feat_cols,
+    }, out_dir / "fastest_lap_encoders.joblib")
+    print("Saved fastest lap model.")
+
+
 if __name__ == "__main__":
     try:
         main()
         train_quali_model()
+        train_race_time_model()
+        train_fastest_lap_model()
     except Exception as e:
         if "RateLimitExceeded" in type(e).__name__ or "RateLimit" in str(e):
             print("\n*** Rate limit exceeded (500 API calls/hour). ***")

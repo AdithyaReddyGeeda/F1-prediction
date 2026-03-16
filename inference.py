@@ -392,6 +392,59 @@ def _build_features(
             fp1_delta = np.zeros(n, dtype=float)
             fp2_delta = np.zeros(n, dtype=float)
             fp3_delta = np.zeros(n, dtype=float)
+
+            # ── Clean air pace ──
+            cap_map = encoders.get("cap_map", {})
+            circuit_cap_map = encoders.get("circuit_cap_map", {})
+            live_cap = {}
+            try:
+                from data import load_clean_air_pace
+                _y = encoders.get("current_year", 2026)
+                _r = encoders.get("current_round", 1)
+                cap_live_df = load_clean_air_pace(_y, _r)
+                if not cap_live_df.empty:
+                    live_cap = cap_live_df.set_index("Abbreviation")["clean_air_pace_sec"].to_dict()
+            except Exception:
+                pass
+            global_cap_fallback = float(np.mean(list(cap_map.values()))) if cap_map else 88.0
+            circuit_cap_fallback = circuit_cap_map.get(circuit, global_cap_fallback)
+            clean_air_pace = np.array([
+                live_cap.get(a) or cap_map.get(a) or circuit_cap_fallback
+                for a in abbrevs
+            ], dtype=float)
+
+            # ── Sector times ──
+            sector_map = encoders.get("sector_map", {})
+            live_sectors = {}
+            try:
+                from data import load_quali_sector_times
+                _y = encoders.get("current_year", 2026)
+                _r = encoders.get("current_round", 1)
+                sec_live_df = load_quali_sector_times(_y, _r)
+                if not sec_live_df.empty:
+                    for col in ["s1_gap", "s2_gap", "s3_gap", "total_sector_gap", "s1_pct", "s2_pct", "s3_pct"]:
+                        if col in sec_live_df.columns:
+                            live_sectors[col] = sec_live_df.set_index("Abbreviation")[col].to_dict()
+            except Exception:
+                pass
+
+            def _get_sector_feature(col, driver_abbrev, circuit_name):
+                if col in live_sectors and driver_abbrev in live_sectors[col]:
+                    return float(live_sectors[col][driver_abbrev])
+                driver_map = sector_map.get("{}_by_driver".format(col), {})
+                if driver_abbrev in driver_map:
+                    return float(driver_map[driver_abbrev])
+                circuit_med_map = sector_map.get("{}_by_circuit".format(col), {})
+                return float(circuit_med_map.get(circuit_name, 0.0))
+
+            s1_gap_arr = np.array([_get_sector_feature("s1_gap", a, circuit) for a in abbrevs])
+            s2_gap_arr = np.array([_get_sector_feature("s2_gap", a, circuit) for a in abbrevs])
+            s3_gap_arr = np.array([_get_sector_feature("s3_gap", a, circuit) for a in abbrevs])
+            total_sector_gap_arr = np.array([_get_sector_feature("total_sector_gap", a, circuit) for a in abbrevs])
+            s1_pct_arr = np.array([_get_sector_feature("s1_pct", a, circuit) for a in abbrevs])
+            s2_pct_arr = np.array([_get_sector_feature("s2_pct", a, circuit) for a in abbrevs])
+            s3_pct_arr = np.array([_get_sector_feature("s3_pct", a, circuit) for a in abbrevs])
+
             t = _circuit_to_type(circuit)
             street = 1.0 if t == "street" else 0.0
             high = 1.0 if t == "high_speed" else 0.0
@@ -413,8 +466,12 @@ def _build_features(
                 driver_dnf_rate, circuit_abrasion_proxy, tyre_life_penalty_proxy,
                 driver_tyre_management_proxy, form_x_teammate_delta, momentum, driver_rain_delta,
                 fp1_delta, fp2_delta, fp3_delta,
-                driver_enc, team_enc,
             ])
+            if "clean_air_pace_sec" in (feature_names or []):
+                stack_parts.append(clean_air_pace)
+            if "s1_gap" in (feature_names or []):
+                stack_parts.extend([s1_gap_arr, s2_gap_arr, s3_gap_arr, total_sector_gap_arr, s1_pct_arr, s2_pct_arr, s3_pct_arr])
+            stack_parts.extend([driver_enc, team_enc])
             if engine_enc is not None:
                 stack_parts.append(engine_enc)
             stack_parts.extend([
