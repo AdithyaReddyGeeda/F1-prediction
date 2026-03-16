@@ -13,7 +13,7 @@ import pandas as pd
 
 from data import get_event_schedule, load_qualifying_results
 
-ROOKIE_QUALI_BASELINE = 13.0  # default avg quali pos for new drivers
+ROOKIE_QUALI_BASELINE = 12.0  # default avg quali pos for new drivers
 QUALI_MODEL_DIR = Path(__file__).resolve().parent / "model_artifacts"
 QUALI_MODEL_PATH = Path(__file__).resolve().parent / "models" / "quali_model.joblib"
 QUALI_ENCODERS_PATH = Path(__file__).resolve().parent / "models" / "quali_encoders.joblib"
@@ -263,9 +263,21 @@ def _build_quali_features(
             weather_onehot = enc_weather.transform(np.array([[w]])).reshape(1, -1)
             weather_onehot = np.repeat(weather_onehot, n, axis=0)
 
-        driver_enc = enc_driver.transform(abbrevs)
-        team_enc = enc_team.transform(teams)
-        circuit_enc = enc_circuit.transform([circuit] * n)
+        def _safe_label_transform(encoder, values, default: int = 0) -> np.ndarray:
+            """Safely transform labels; unknown values map to default index."""
+            classes = list(getattr(encoder, "classes_", []))
+            known = set(classes)
+            out = []
+            for v in values:
+                if v in known:
+                    out.append(float(encoder.transform([v])[0]))
+                else:
+                    out.append(float(default))
+            return np.array(out, dtype=float)
+
+        driver_enc = _safe_label_transform(enc_driver, abbrevs)
+        team_enc = _safe_label_transform(enc_team, teams)
+        circuit_enc = _safe_label_transform(enc_circuit, [circuit] * n)
 
         X = np.column_stack([
             quali_form_arr,

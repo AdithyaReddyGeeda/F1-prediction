@@ -258,9 +258,10 @@ def predict_finishing_order(
         _INFERENCE_WARNINGS.append(traceback.format_exc())
 
     grid_df["Form"] = [form.get(a, ROOKIE_AVG_POS) for a in abbrevs]
-    # Weather-aware: add noise for Wet/Rain so same grid can yield different order
+    # Weather-aware: add deterministic noise for Wet/Rain so same grid yields reproducible order per race
     if weather_str != "Dry":
-        rng = np.random.default_rng(hash(weather_str) % (2**32))
+        seed = abs(hash(f"{circuit}_{round_number}_{year}_{weather_str}")) % (2**32)
+        rng = np.random.default_rng(seed)
         grid_df["_noise"] = rng.uniform(-1.2, 1.2, size=len(grid_df))
         grid_df["Form"] = grid_df["Form"] + grid_df["_noise"]
     grid_df = grid_df.sort_values(["Form", "GridPosition"]).reset_index(drop=True)
@@ -483,7 +484,14 @@ def _build_features(
             scale_idx = encoders.get("scale_idx")
             if scaler is not None and scale_idx is not None:
                 X = X.astype(float)
-                X[:, scale_idx] = scaler.transform(X[:, scale_idx])
+                # Validate scale_idx bounds before applying scaler
+                safe_idx = [i for i in scale_idx if 0 <= i < X.shape[1]]
+                if len(safe_idx) != len(scale_idx):
+                    _INFERENCE_WARNINGS.append(
+                        f"scale_idx out of bounds for feature matrix (got {scale_idx}, using {safe_idx})"
+                    )
+                if safe_idx:
+                    X[:, safe_idx] = scaler.transform(X[:, safe_idx])
         else:
             # Legacy 9-feature matrix
             X = np.column_stack([

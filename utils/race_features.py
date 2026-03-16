@@ -11,9 +11,10 @@ import numpy as np
 import pandas as pd
 
 try:
-    from config import ENGINE_BY_TEAM
+    from config import ENGINE_BY_TEAM, CIRCUIT_METADATA
 except ImportError:
     ENGINE_BY_TEAM = {}
+    CIRCUIT_METADATA = {}
 
 # Defaults for rookies / missing data
 DEFAULT_AVG_POS = 12.0
@@ -25,17 +26,23 @@ DNF_IMPUTE_EARLY_LAPS = 20
 
 # Circuit name -> type for track characteristic dummies (simplified mapping)
 CIRCUIT_TYPE_MAP = {
+    # City / hybrid street layouts
     "street": [
         "Monaco", "Baku", "Singapore", "Miami", "Las Vegas", "Australian", "Canadian",
-        "Saudi", "Bahrain", "Abu Dhabi", "Qatar", "Azerbaijan",
+        "Saudi", "Abu Dhabi", "Qatar", "Azerbaijan",
+        "Mexico City", "Mexico", "Sao Paulo", "São Paulo",
     ],
+    # High-speed permanent circuits
     "high_speed": [
         "Monza", "Spa", "Sakhir", "Jeddah", "Silverstone", "Japanese", "Suzuka",
-        "British", "Belgian", "Italian", "Bahrain",
+        "British", "Belgian", "Italian", "Bahrain", "Austrian", "Red Bull Ring",
+        "United States", "COTA",
     ],
+    # More technical / twisty layouts
     "technical": [
-        "Hungaroring", "Zandvoort", "Spanish", "Barcelona", "Monaco", "Singapore",
-        "Hungarian", "Dutch", "Spanish", "Portuguese", "Emilia", "Imola",
+        "Hungaroring", "Zandvoort", "Spanish", "Barcelona",
+        "Hungarian", "Dutch", "Portuguese", "Emilia", "Imola",
+        "Chinese", "Shanghai",
     ],
 }
 
@@ -460,7 +467,20 @@ def build_race_feature_df(
 
     # Tyre degradation proxies: circuit abrasion, tyre life penalty (default 0.5), driver tyre from stint data when available
     df["circuit_abrasion_proxy"] = df["Circuit"].map(get_circuit_abrasion_proxy).values
-    df["tyre_life_penalty_proxy"] = get_tyre_life_penalty_proxy(0.5)
+    # Tyre life proxy per circuit, based on scheduled race laps
+    tyre_map: dict[str, float] = {}
+    for name, meta in getattr(CIRCUIT_METADATA, "items", lambda: [])():
+        try:
+            laps = int(meta.get("laps", 0))
+        except Exception:
+            laps = 0
+        if laps > 60:
+            tyre_map[name] = 0.6
+        elif laps >= 50:
+            tyre_map[name] = 0.5
+        else:
+            tyre_map[name] = 0.4
+    df["tyre_life_penalty_proxy"] = df["Circuit"].map(tyre_map).fillna(0.5)
     df["driver_tyre_management_proxy"] = 0.0
     if tyre_proxy_df is not None and not tyre_proxy_df.empty and "tyre_proxy" in tyre_proxy_df.columns:
         df = df.merge(

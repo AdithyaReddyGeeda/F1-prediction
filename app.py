@@ -337,13 +337,13 @@ summary { color: #e10600 !important; font-weight: bold !important; }
 </style>
 """, unsafe_allow_html=True)
 
-    st.markdown("""
+    st.markdown(f"""
 <div style='display:flex; align-items:center; gap:16px; margin-bottom:8px;'>
     <span style='font-size:2.8rem;'>🏎️</span>
     <div>
         <h1 style='margin:0; font-size:2rem;'>F1 RACE PREDICTOR</h1>
         <p style='color:#888; margin:0; font-size:0.9rem; letter-spacing:2px;'>
-            POWERED BY XGBOOST + FASTF1 · 2026 SEASON
+            POWERED BY XGBOOST + FASTF1 · {year} SEASON
         </p>
     </div>
 </div>
@@ -515,9 +515,15 @@ F1 data via FastF1 API<br>Model: XGBoost · MAE ~6 pos
                     if not pred_from_quali.empty:
                         st.subheader("Race prediction (from qualifying grid)")
                         render_prediction_table(pred_from_quali)
+                        # Include extra useful columns in CSV when available
+                        export_cols = []
+                        for col in ["PredictedRank", "Driver", "Team", "GridPosition", "QualiPosition"]:
+                            if col in pred_from_quali.columns:
+                                export_cols.append(col)
+                        export_df = pred_from_quali[export_cols] if export_cols else pred_from_quali
                         st.download_button(
                             "Download race prediction (CSV)",
-                            data=pred_from_quali.to_csv(index=False),
+                            data=export_df.to_csv(index=False),
                             file_name=f"race_prediction_{event_name.replace(' ', '_')}_R{round_number}.csv",
                             mime="text/csv",
                             key="dl_race_from_quali",
@@ -589,9 +595,15 @@ F1 data via FastF1 API<br>Model: XGBoost · MAE ~6 pos
                     st.warning("⚠️ Heuristic fallback (form only)")
                 st.subheader("Predicted finishing order")
                 render_prediction_table(pred_df, grid_df)
+                # Include extra useful columns in CSV when available
+                export_cols = []
+                for col in ["PredictedRank", "Driver", "Team", "GridPosition", "QualiPosition"]:
+                    if col in pred_df.columns:
+                        export_cols.append(col)
+                export_df = pred_df[export_cols] if export_cols else pred_df
                 st.download_button(
                     "Download race prediction (CSV)",
-                    data=pred_df.to_csv(index=False),
+                    data=export_df.to_csv(index=False),
                     file_name=f"race_prediction_{event_name.replace(' ', '_')}_R{round_number}.csv",
                     mime="text/csv",
                     key="dl_race_pred",

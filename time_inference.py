@@ -83,7 +83,13 @@ def predict_race_time(
             if scaler is not None:
                 X = scaler.transform(X)
             pred = float(model.predict(X)[0])
-            weather_mult = 1.0 if weather_str == "Dry" else (1.12 if weather_str == "Rain" else 1.06)
+            # Consistent weather multipliers for both model and heuristic paths
+            if weather_str == "Rain":
+                weather_mult = 1.12
+            elif weather_str == "Wet":
+                weather_mult = 1.06
+            else:
+                weather_mult = 1.0
             pred_wet = pred * weather_mult if weather_str != "Dry" else pred
             return {
                 "predicted_sec": pred_wet,
@@ -97,7 +103,12 @@ def predict_race_time(
 
     # Heuristic fallback
     if pole_time_sec is not None and total_laps > 0:
-        weather_mult = 1.0 if weather_str == "Dry" else (1.13 if weather_str == "Rain" else 1.07)
+        if weather_str == "Rain":
+            weather_mult = 1.12
+        elif weather_str == "Wet":
+            weather_mult = 1.06
+        else:
+            weather_mult = 1.0
         est = pole_time_sec * total_laps * 1.034 * weather_mult
         return {
             "predicted_sec": est,
