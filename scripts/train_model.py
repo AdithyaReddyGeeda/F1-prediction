@@ -1089,8 +1089,24 @@ def train_race_time_model():
     max_std = max(sc_proxy_map.values()) if sc_proxy_map else 1
     sc_proxy_map = {k: v / max_std for k, v in sc_proxy_map.items()}
 
+    from data import load_race_weather
     rng = np.random.default_rng(42)
-    df["Weather"] = rng.choice(["Dry", "Wet", "Rain"], size=len(df), p=[0.65, 0.25, 0.10])
+    weather_per_race_rt: dict[tuple[int, int], str] = {}
+    keys_rt = df[["Year", "Round"]].drop_duplicates()
+    for _, row in keys_rt.iterrows():
+        y, r = int(row["Year"]), int(row["Round"])
+        try:
+            w = load_race_weather(y, r)
+        except Exception:
+            w = None
+        if w is not None:
+            weather_per_race_rt[(y, r)] = w
+        else:
+            weather_per_race_rt[(y, r)] = rng.choice(["Dry", "Wet", "Rain"], p=[0.65, 0.25, 0.10])
+    df["Weather"] = df.apply(
+        lambda row: weather_per_race_rt.get((int(row["Year"]), int(row["Round"])), "Dry"),
+        axis=1,
+    )
 
     enc_circuit = LabelEncoder()
     enc_circuit.fit(list(df["Circuit"].unique()) + list(CIRCUIT_METADATA.keys()))
@@ -1217,8 +1233,24 @@ def train_fastest_lap_model():
         global_team_fl_rate[team].append(rate)
     global_team_fl_rate = {t: np.mean(v) for t, v in global_team_fl_rate.items()}
 
+    from data import load_race_weather
     rng = np.random.default_rng(42)
-    df["Weather"] = rng.choice(["Dry", "Wet", "Rain"], size=len(df), p=[0.65, 0.25, 0.10])
+    weather_per_race_fl: dict[tuple[int, int], str] = {}
+    keys_fl = df[["Year", "Round"]].drop_duplicates()
+    for _, row in keys_fl.iterrows():
+        y, r = int(row["Year"]), int(row["Round"])
+        try:
+            w = load_race_weather(y, r)
+        except Exception:
+            w = None
+        if w is not None:
+            weather_per_race_fl[(y, r)] = w
+        else:
+            weather_per_race_fl[(y, r)] = rng.choice(["Dry", "Wet", "Rain"], p=[0.65, 0.25, 0.10])
+    df["Weather"] = df.apply(
+        lambda row: weather_per_race_fl.get((int(row["Year"]), int(row["Round"])), "Dry"),
+        axis=1,
+    )
     enc_circuit = LabelEncoder()
     enc_circuit.fit(list(df["Circuit"].unique()) + list(CIRCUIT_METADATA.keys()))
     df["circuit_enc"] = enc_circuit.transform(df["Circuit"].astype(str))

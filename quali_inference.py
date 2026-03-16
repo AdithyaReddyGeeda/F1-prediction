@@ -82,7 +82,21 @@ def fetch_quali_form(
     combined = pd.concat(collected, ignore_index=True).dropna(subset=["Position", "Abbreviation"])
     if combined.empty:
         return out
-    agg = combined.groupby("Abbreviation")["Position"].mean()
+
+    # EWMA over history (alpha=0.4) to match race model form logic
+    history_sorted = combined.sort_values(["Abbreviation", "Year", "Round"])
+    agg_dict: dict[str, float] = {}
+    alpha = 0.4
+    for driver, group in history_sorted.groupby("Abbreviation"):
+        pos = group["Position"].astype(float).values
+        if len(pos) == 0:
+            continue
+        weights = np.array([(1 - alpha) ** i for i in range(len(pos) - 1, -1, -1)], dtype=float)
+        if weights.sum() == 0:
+            continue
+        weights /= weights.sum()
+        agg_dict[driver] = float(np.dot(weights, pos))
+    agg = pd.Series(agg_dict)
     for ab in driver_abbrevs:
         if ab in agg.index:
             out[ab] = float(agg[ab])
@@ -131,7 +145,21 @@ def fetch_constructor_quali_strength(
     combined = pd.concat(collected, ignore_index=True)
     pos_col = "QualiPosition" if "QualiPosition" in combined.columns else "Position"
     combined["Position"] = pd.to_numeric(combined[pos_col], errors="coerce")
-    team_avg = combined.groupby("TeamName")["Position"].mean()
+
+    # EWMA per team on best quali position, not simple mean
+    hist_sorted = combined.sort_values(["TeamName", "Year", "Round"])
+    team_vals: dict[str, float] = {}
+    alpha = 0.4
+    for team, group in hist_sorted.groupby("TeamName"):
+        pos = group["Position"].astype(float).values
+        if len(pos) == 0:
+            continue
+        weights = np.array([(1 - alpha) ** i for i in range(len(pos) - 1, -1, -1)], dtype=float)
+        if weights.sum() == 0:
+            continue
+        weights /= weights.sum()
+        team_vals[team] = float(np.dot(weights, pos))
+    team_avg = pd.Series(team_vals)
     for t in team_names:
         if t in team_avg.index:
             out[t] = float(team_avg[t])
