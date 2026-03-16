@@ -4,6 +4,7 @@ Features: grid_pos, driver, team, circuit, recent_form, weather one-hot (Dry/Wet
 """
 from __future__ import annotations
 
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -11,9 +12,13 @@ import numpy as np
 import pandas as pd
 
 from config import ROOKIE_DEFAULT_AVG_POSITION, ENGINE_BY_TEAM
+from utils.race_features import get_circuit_abrasion_proxy, _circuit_to_type
 
 # Heuristic fallback (no xgboost required)
 from model import build_prediction_for_event
+
+# Surface inference errors instead of swallowing them (see get_inference_warnings).
+_INFERENCE_WARNINGS: list[str] = []
 
 _MODEL_DIR = Path(__file__).resolve().parent / "model_artifacts"
 _MODEL_PATH = _MODEL_DIR / "xgboost_model.joblib"
@@ -38,8 +43,16 @@ def _load_model_and_encoders():
                     encoders["weather_encoder"] = joblib.load(weather_path)
             return model, encoders
     except Exception:
-        pass
+        _INFERENCE_WARNINGS.append(traceback.format_exc())
     return None, None
+
+
+def get_inference_warnings() -> list[str]:
+    """Return and clear the list of inference warnings (e.g. for display in UI)."""
+    global _INFERENCE_WARNINGS
+    out = list(_INFERENCE_WARNINGS)
+    _INFERENCE_WARNINGS = []
+    return out
 
 
 def get_recent_form(
@@ -48,9 +61,11 @@ def get_recent_form(
     driver_abbrevs: list,
     history_races: int = 5,
     seasons_back: int = 2,
+    alpha: float = 0.4,
 ) -> dict:
     """
-    For each driver, get average finishing position over last N races (cross-season).
+    For each driver, get EWMA finishing position over last N races (cross-season),
+    matching the training pipeline (utils.race_features.compute_ewma_form).
     Drivers not found get ROOKIE_AVG_POS.
     """
     from data import get_event_schedule, load_race_results
@@ -102,10 +117,22 @@ def get_recent_form(
     if history.empty:
         return driver_form
 
-    agg = history.groupby("Abbreviation")["Position"].mean()
+    # EWMA over recent races, matching training pipeline (higher weight on latest races).
+    history = history.sort_values(["Abbreviation", "Year", "Round"])
+    alpha = float(alpha)
     for ab in driver_abbrevs:
-        if ab in agg.index:
-            driver_form[ab] = float(agg[ab])
+        sub = history[history["Abbreviation"] == ab]
+        if sub.empty:
+            continue
+        pos = sub["Position"].astype(float)
+        if len(pos) == 0:
+            continue
+        weights = np.array([(1 - alpha) ** i for i in range(len(pos) - 1, -1, -1)], dtype=float)
+        if weights.sum() == 0:
+            continue
+        weights /= weights.sum()
+        driver_form[ab] = float(np.dot(weights, pos.values))
+
     return driver_form
 
 
@@ -122,11 +149,12 @@ def predict_finishing_order(
     """
     grid_df: DataFrame with DriverName/Abbreviation, TeamName, GridPosition.
     weather_str: "Dry" | "Wet" | "Rain" (one-hot encoded for model).
-    Returns (pred_df, debug_info) if return_debug else pred_df only.
+    Returns (pred_df, debug_info, source) if return_debug else pred_df only.
+    source is "xgboost" | "heuristic_build" | "heuristic_form".
     """
     if grid_df.empty:
         out = pd.DataFrame(columns=["PredictedRank", "Driver", "Team"])
-        return (out, None) if return_debug else out
+        return (out, None, "heuristic_form") if return_debug else out
 
     grid_df = grid_df.copy()
     if "Driver" not in grid_df.columns:
@@ -136,22 +164,72 @@ def predict_finishing_order(
     if "GridPosition" not in grid_df.columns:
         grid_df["GridPosition"] = np.arange(1, len(grid_df) + 1)
 
-    abbrevs = grid_df.get("Abbreviation", grid_df["Driver"].str[:3].str.upper()).tolist()
-    form = get_recent_form(year, round_number, abbrevs)
-
+    # Load model/encoders first so we can read ewma_alpha / blend info.
     model, encoders = _load_model_and_encoders() if use_xgboost and not force_heuristic else (None, None)
+    ewma_alpha = 0.4
+    if encoders is not None:
+        try:
+            ewma_alpha = float(encoders.get("ewma_alpha", ewma_alpha))
+        except Exception:
+            pass
+
+    abbrevs = grid_df.get("Abbreviation", grid_df["Driver"].str[:3].str.upper()).tolist()
+    form = get_recent_form(year, round_number, abbrevs, alpha=ewma_alpha)
     debug_info = None
 
     if model is not None and encoders is not None:
         try:
+            # Pass current context into encoders so feature builder can align GridPosition semantics.
+            encoders = dict(encoders)
+            encoders["current_year"] = year
+            encoders["current_round"] = round_number
             X, debug_info = _build_features(
                 grid_df, circuit, weather_str, form, encoders, return_debug=return_debug
             )
             if X is not None and len(X) == len(grid_df):
                 pred_pos = model.predict(X)
                 pred_pos = np.clip(pred_pos, 1.0, 22.0)
+                if encoders.get("lgb_ensemble"):
+                    try:
+                        import joblib as _jl
+                        _lgb_path = _MODEL_DIR / "lgb_model.joblib"
+                        if _lgb_path.exists():
+                            lgb_model = _jl.load(_lgb_path)
+                            lgb_preds = lgb_model.predict(X)
+                            pred_pos = 0.6 * pred_pos + 0.4 * lgb_preds
+                            pred_pos = np.clip(pred_pos, 1.0, 22.0)
+                    except Exception:
+                        pass
+
+                # Blend with QualiPosition (or GridPosition fallback) and assign per-race ranks,
+                # matching training-time post-processing.
+                feature_names = encoders.get("feature_names") or []
+                quali_pos = grid_df["GridPosition"].values.astype(float)
+                if feature_names and "QualiPosition" in feature_names:
+                    try:
+                        q_idx = feature_names.index("QualiPosition")
+                        quali_pos = X[:, q_idx]
+                    except Exception:
+                        pass
+
+                # Circuit-type-specific blend if available, else global blend_ratio, else 0.7.
+                blend_ratio = 0.7
+                circuit_type = _circuit_to_type(circuit)
+                blend_by_type = encoders.get("blend_by_type") or {}
+                if circuit_type in blend_by_type:
+                    blend_ratio = float(blend_by_type[circuit_type])
+                else:
+                    blend_ratio = float(encoders.get("blend_ratio", blend_ratio))
+
+                pred_blended = blend_ratio * pred_pos + (1.0 - blend_ratio) * quali_pos
+                pred_blended = np.clip(pred_blended, 1.0, 22.0)
+
+                order = np.argsort(pred_blended)
+                ranks = np.empty_like(order)
+                ranks[order] = np.arange(1, len(order) + 1)
+
                 grid_df = grid_df.copy()
-                grid_df["PredictedPosition"] = pred_pos
+                grid_df["PredictedPosition"] = ranks.astype(float)
                 grid_df = grid_df.sort_values("PredictedPosition").reset_index(drop=True)
                 grid_df["PredictedRank"] = np.arange(1, len(grid_df) + 1)
                 out = grid_df[["PredictedRank", "Driver", "Team"]]
@@ -159,9 +237,9 @@ def predict_finishing_order(
                     fn = debug_info.get("feature_names", [])
                     imp = model.feature_importances_.tolist()
                     debug_info["feature_importances"] = dict(zip(fn, imp)) if fn else dict(zip(range(len(imp)), imp))
-                return (out, debug_info) if return_debug else out
+                return (out, debug_info, "xgboost") if return_debug else out
         except Exception:
-            pass
+            _INFERENCE_WARNINGS.append(traceback.format_exc())
 
     try:
         pred = build_prediction_for_event(year, round_number, history_races=5, seasons_back=2)
@@ -175,9 +253,9 @@ def predict_finishing_order(
                 out["_sort"] = out["PredictedRank"].values.astype(float) + noise
                 out = out.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
                 out["PredictedRank"] = np.arange(1, len(out) + 1)
-            return (out, None) if return_debug else out
+            return (out, None, "heuristic_build") if return_debug else out
     except Exception:
-        pass
+        _INFERENCE_WARNINGS.append(traceback.format_exc())
 
     grid_df["Form"] = [form.get(a, ROOKIE_AVG_POS) for a in abbrevs]
     # Weather-aware: add noise for Wet/Rain so same grid can yield different order
@@ -190,26 +268,7 @@ def predict_finishing_order(
         grid_df = grid_df.drop(columns=["_noise"])
     grid_df["PredictedRank"] = np.arange(1, len(grid_df) + 1)
     out = grid_df[["PredictedRank", "Driver", "Team"]]
-    return (out, None) if return_debug else out
-
-
-def _circuit_abrasion_proxy(circuit: str) -> float:
-    """0=low, 0.5=med, 1=high. Matches utils.race_features."""
-    c = str(circuit).lower()
-    if any(x in c for x in ["bahrain", "abu dhabi", "barcelona", "spanish", "silverstone", "british", "suzuka", "japanese"]):
-        return 1.0
-    if any(x in c for x in ["monza", "italian", "spa", "belgian", "monaco", "miami", "hungaroring", "hungarian", "zandvoort", "dutch"]):
-        return 0.5
-    return 0.0
-
-
-def _circuit_type_dummies(circuit: str) -> tuple[float, float, float]:
-    """Return (street, high_speed, technical) 0/1 dummies. Matches utils.race_features."""
-    c = str(circuit).lower()
-    street = 1.0 if any(x in c for x in ["monaco", "baku", "singapore", "miami", "vegas", "australian", "canadian", "saudi", "bahrain", "abu dhabi", "qatar", "azerbaijan"]) else 0.0
-    high = 1.0 if any(x in c for x in ["monza", "spa", "sakhir", "jeddah", "silverstone", "japanese", "suzuka", "british", "belgian", "italian"]) else 0.0
-    technical = 1.0 if (street == 0.0 and high == 0.0) else 0.0
-    return street, high, technical
+    return (out, None, "heuristic_form") if return_debug else out
 
 
 def _build_features(
@@ -274,15 +333,57 @@ def _build_features(
             track_team_map = encoders.get("track_avg_team_map") or {}
             synergy_map = encoders.get("driver_team_synergy_map") or {}
             rain_delta_map = encoders.get("driver_rain_delta_map") or {}
+            # Qualifying position: actual grid slot
             quali_pos = grid_pos
+            # Quali gap to pole (seconds); only if model was trained with this feature
+            use_quali_gap = "quali_gap_to_pole" in (feature_names or [])
+            quali_gap_to_pole = np.full(n, 2.0, dtype=float)
+            if use_quali_gap:
+                try:
+                    from data import load_quali_gaps
+                    _y = encoders.get("current_year", 2026)
+                    _r = encoders.get("current_round", 1)
+                    qg_df = load_quali_gaps(_y, _r)
+                    if not qg_df.empty and "Abbreviation" in qg_df.columns and "quali_gap_to_pole" in qg_df.columns:
+                        gap_map = qg_df.set_index("Abbreviation")["quali_gap_to_pole"].to_dict()
+                        for i, ab in enumerate(abbrevs):
+                            if ab in gap_map and pd.notna(gap_map[ab]):
+                                quali_gap_to_pole[i] = float(gap_map[ab])
+                except Exception:
+                    pass
+            # GridPosition in training is previous race finish; reuse get_recent_form with history_races=1
+            # If last-race result is missing, fall back to current grid position.
+            try:
+                prev_form = get_recent_form(
+                    year=encoders.get("current_year", 2026),
+                    round_number=encoders.get("current_round", 1),
+                    driver_abbrevs=abbrevs,
+                    history_races=1,
+                    seasons_back=2,
+                    alpha=float(encoders.get("ewma_alpha", 0.4)),
+                )
+            except Exception:
+                _INFERENCE_WARNINGS.append(traceback.format_exc())
+                prev_form = {}
+            # If last race result missing, fall back to current grid position
+            grid_prev = np.array(
+                [prev_form.get(a, gp) for a, gp in zip(abbrevs, grid_pos)],
+                dtype=float,
+            )
             constructor_ewma = recent_form
             track_avg_driver = np.array([track_driver_map.get((a, circuit), default_track) for a in abbrevs], dtype=float)
             track_avg_team = np.array([track_team_map.get((t, circuit), default_track) for t in teams], dtype=float)
             driver_team_synergy = np.array([synergy_map.get((a, t), default_synergy) for a, t in zip(abbrevs, teams)], dtype=float)
             teammate_delta = np.zeros(n, dtype=float)
             constructor_dnf_rate = np.zeros(n, dtype=float)
+            use_circuit_dnf = "constructor_dnf_rate_at_circuit" in (feature_names or [])
+            circuit_dnf_rate_map = encoders.get("circuit_dnf_rate_map") or {}
+            constructor_dnf_rate_at_circuit = np.array(
+                [circuit_dnf_rate_map.get((t, circuit), 0.0) for t in teams],
+                dtype=float,
+            )
             driver_dnf_rate = np.zeros(n, dtype=float)
-            circuit_abrasion_proxy = np.full(n, _circuit_abrasion_proxy(circuit))
+            circuit_abrasion_proxy = np.full(n, get_circuit_abrasion_proxy(circuit))
             tyre_life_penalty_proxy = np.full(n, 0.5)
             driver_tyre_management_proxy = np.zeros(n, dtype=float)
             form_x_teammate_delta = np.zeros(n, dtype=float)
@@ -291,18 +392,29 @@ def _build_features(
             fp1_delta = np.zeros(n, dtype=float)
             fp2_delta = np.zeros(n, dtype=float)
             fp3_delta = np.zeros(n, dtype=float)
-            street, high, tech = _circuit_type_dummies(circuit)
+            t = _circuit_to_type(circuit)
+            street = 1.0 if t == "street" else 0.0
+            high = 1.0 if t == "high_speed" else 0.0
+            tech = 1.0 if t == "technical" else 0.0
             circuit_type_street = np.full(n, street)
             circuit_type_high_speed = np.full(n, high)
             circuit_type_technical = np.full(n, tech)
-            stack_parts = [
-                grid_pos, quali_pos, recent_form, constructor_ewma,
+            stack_parts = [grid_prev, quali_pos]
+            if use_quali_gap:
+                stack_parts.append(quali_gap_to_pole)
+            stack_parts.extend([
+                recent_form, constructor_ewma,
                 track_avg_driver, track_avg_team, driver_team_synergy, teammate_delta,
-                constructor_dnf_rate, driver_dnf_rate, circuit_abrasion_proxy, tyre_life_penalty_proxy,
+                constructor_dnf_rate,
+            ])
+            if use_circuit_dnf:
+                stack_parts.append(constructor_dnf_rate_at_circuit)
+            stack_parts.extend([
+                driver_dnf_rate, circuit_abrasion_proxy, tyre_life_penalty_proxy,
                 driver_tyre_management_proxy, form_x_teammate_delta, momentum, driver_rain_delta,
                 fp1_delta, fp2_delta, fp3_delta,
                 driver_enc, team_enc,
-            ]
+            ])
             if engine_enc is not None:
                 stack_parts.append(engine_enc)
             stack_parts.extend([
@@ -347,4 +459,5 @@ def _build_features(
             }
         return X, debug_info
     except Exception:
+        _INFERENCE_WARNINGS.append(traceback.format_exc())
         return None, None

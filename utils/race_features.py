@@ -146,12 +146,26 @@ def get_track_specific_avg(
             & ((df["Year"] < yr) | ((df["Year"] == yr) & (df["Round"] < rnd)))
         ].sort_values(["Year", "Round"])
         if len(past_d) > 0:
-            driver_avg.loc[i] = past_d[position_col].tail(max_visits).mean()
+            vals_d = past_d[position_col].tail(max_visits).values.astype(float)
+            alpha_track = 0.35
+            w_d = np.array([(1 - alpha_track) ** j for j in range(len(vals_d) - 1, -1, -1)], dtype=float)
+            if w_d.sum() > 0:
+                w_d /= w_d.sum()
+                driver_avg.loc[i] = float(np.dot(w_d, vals_d))
+            else:
+                driver_avg.loc[i] = DEFAULT_TRACK_AVG
         else:
             driver_avg.loc[i] = DEFAULT_TRACK_AVG
         if len(past_t) > 0:
             team_best_per_race = past_t.groupby(["Year", "Round"])[position_col].min().tail(max_visits)
-            team_avg.loc[i] = team_best_per_race.mean()
+            vals_t = team_best_per_race.values.astype(float)
+            alpha_track = 0.35
+            w_t = np.array([(1 - alpha_track) ** j for j in range(len(vals_t) - 1, -1, -1)], dtype=float)
+            if w_t.sum() > 0:
+                w_t /= w_t.sum()
+                team_avg.loc[i] = float(np.dot(w_t, vals_t))
+            else:
+                team_avg.loc[i] = DEFAULT_TRACK_AVG
         else:
             team_avg.loc[i] = DEFAULT_TRACK_AVG
 
@@ -269,6 +283,53 @@ def get_constructor_dnf_rate(
     return out.fillna(0.0)
 
 
+def get_constructor_dnf_rate_at_circuit(
+    df: pd.DataFrame,
+    circuit_col: str = "Circuit",
+    last_n_visits: int = 5,
+    status_col: Optional[str] = "Status",
+    position_col: str = "Position",
+) -> pd.Series:
+    """
+    Per-row: constructor DNF rate at this specific circuit (past visits only).
+    Falls back to global rate if fewer than 2 past visits at circuit.
+    """
+    df = df.sort_values(["Year", "Round"])
+    is_dnf = pd.Series(0.0, index=df.index)
+    if status_col and status_col in df.columns:
+        dnf_flags = df[status_col].astype(str).str.upper().str.contains(
+            "ACCIDENT|COLLISION|DNF|RETIRED|WHEEL|ENGINE|GEARBOX|BRAKE|SUSPENSION|POWER|SPUN|DAMAGE",
+            na=False,
+            regex=True,
+        )
+        is_dnf = dnf_flags.astype(float)
+    pos = df[position_col].astype(float)
+    is_dnf = is_dnf.where(is_dnf == 1.0, ((pos > 20) | pos.isna()).astype(float))
+
+    out = pd.Series(index=df.index, dtype=float)
+    for team in df["TeamName"].unique():
+        mask = df["TeamName"] == team
+        sub = df.loc[mask].sort_values(["Year", "Round"])
+        for i, (idx, row) in enumerate(sub.iterrows()):
+            circ = row[circuit_col]
+            yr, rnd = row["Year"], row["Round"]
+            past_at_circuit = sub[
+                (sub[circuit_col] == circ)
+                & ((sub["Year"] < yr) | ((sub["Year"] == yr) & (sub["Round"] < rnd)))
+            ]
+            if len(past_at_circuit) >= 2:
+                last = past_at_circuit.tail(last_n_visits)
+                out.loc[idx] = is_dnf.loc[last.index].mean()
+            else:
+                past_global = sub.iloc[:i]
+                if len(past_global) > 0:
+                    last = past_global.tail(last_n_visits)
+                    out.loc[idx] = is_dnf.loc[last.index].mean()
+                else:
+                    out.loc[idx] = 0.0
+    return out.fillna(0.0)
+
+
 # Circuit abrasion proxy: high tyre degradation tracks (0=low, 0.5=med, 1=high)
 CIRCUIT_ABRASION = {
     "high": ["Bahrain", "Abu Dhabi", "Barcelona", "Spanish", "Silverstone", "British", "Suzuka", "Japanese"],
@@ -378,9 +439,16 @@ def build_race_feature_df(
     # Relative teammate: driver form minus teammate form (same race/team)
     df["teammate_delta"] = get_relative_teammate_delta(df, form_col="RecentForm").values
 
-    # Constructor DNF rate (past last_n races)
+    # Constructor DNF rate (past last_n races, global and track-specific)
     df["constructor_dnf_rate"] = get_constructor_dnf_rate(
         df, last_n=10, position_col="Position", status_col="Status" if "Status" in df.columns else None
+    ).values
+    df["constructor_dnf_rate_at_circuit"] = get_constructor_dnf_rate_at_circuit(
+        df,
+        circuit_col="Circuit",
+        last_n_visits=5,
+        status_col="Status" if "Status" in df.columns else None,
+        position_col="Position",
     ).values
 
     # Driver DNF rate (past last_n races)

@@ -1,1 +1,9 @@
 fastf1_cache/
+pycache/
+*.py[cod]
+*.pyo
+.env
+*.joblib
+model_artifacts/
+models/
+.DS_Store

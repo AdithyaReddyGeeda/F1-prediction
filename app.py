@@ -10,6 +10,7 @@ from pathlib import Path
 import altair as alt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
@@ -18,16 +19,39 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import GRID_2026
-from inference import predict_finishing_order
+from inference import predict_finishing_order, get_inference_warnings
 from quali_inference import predict_quali_order
 from data import enable_fastf1_cache, get_event_schedule, load_race_results
 from utils.data_fetch import safe_get_drivers, safe_get_schedule
 from utils.circuit_geo import get_circuit_track_data
 
+TEAM_COLORS = {
+    "Mercedes": "#00D2BE", "Ferrari": "#E8002D", "Red Bull Racing": "#3671C6",
+    "McLaren": "#FF8000", "Aston Martin": "#358C75", "Alpine": "#FF87BC",
+    "Williams": "#64C4FF", "Racing Bulls": "#6692FF", "Haas": "#B6BABD",
+    "Audi": "#B6BABD", "Cadillac": "#FFFFFF", "Sauber": "#52E252",
+}
+
+TEAM_NAME_ALIASES = {
+    "Red Bull": "Red Bull Racing",
+    "Kick Sauber": "Sauber",
+    "Stake F1 Team Kick Sauber": "Sauber",
+    "Alpine F1 Team": "Alpine",
+    "Haas F1 Team": "Haas",
+    "RB F1 Team": "Racing Bulls",
+    "Visa Cash App RB": "Racing Bulls",
+    "MoneyGram Haas F1 Team": "Haas",
+    "BWT Alpine F1 Team": "Alpine",
+}
+
+
+def normalize_team_name(name: str) -> str:
+    return TEAM_NAME_ALIASES.get(str(name).strip(), str(name).strip())
+
 
 @st.cache_data(ttl=600)
-def _cached_load_race_results(year: int, round_number: int):
-    """Cached FastF1 race results for faster reruns/refreshes."""
+def _cached_load_race_results(year: int, round_number: int, refresh_ts: float = 0):
+    """Cached race results. Pass refresh_ts from session state to force refresh."""
     return load_race_results(year, round_number)
 
 
@@ -137,6 +161,89 @@ def _race_result_to_grid_df(race_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(grid_list)
 
 
+def render_prediction_table(pred_df, grid_df=None):
+    """Render prediction table with team color dots and medal-style positions."""
+    rows_html = ""
+    for _, row in pred_df.iterrows():
+        team = str(row.get("Team", ""))
+        color = TEAM_COLORS.get(team, "#888888")
+        rank = int(row["PredictedRank"])
+        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"P{rank}"
+        rows_html += f"""
+        <tr style='border-bottom:1px solid #222;'>
+            <td style='padding:8px 12px; font-weight:bold; color:{"#ffd700" if rank<=3 else "#fff"};
+                       font-size:1.1rem;'>{medal}</td>
+            <td style='padding:8px 4px;'>
+                <span style='display:inline-block; width:12px; height:12px; border-radius:50%;
+                             background:{color}; margin-right:8px;'></span>
+                {row.get("Driver", "")}
+            </td>
+            <td style='padding:8px 12px; color:#aaa;'>{team}</td>
+        </tr>"""
+    st.markdown(f"""
+    <table style='width:100%; border-collapse:collapse; background:#111; border-radius:8px;
+                  overflow:hidden; font-family:Arial,sans-serif;'>
+        <thead>
+            <tr style='background:#1a1a1a;'>
+                <th style='padding:10px 12px; color:#e10600; text-align:left; text-transform:uppercase;
+                           letter-spacing:1px; font-size:0.8rem;'>POS</th>
+                <th style='padding:10px 12px; color:#e10600; text-align:left; text-transform:uppercase;
+                           letter-spacing:1px; font-size:0.8rem;'>DRIVER</th>
+                <th style='padding:10px 12px; color:#e10600; text-align:left; text-transform:uppercase;
+                           letter-spacing:1px; font-size:0.8rem;'>TEAM</th>
+            </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+    </table>""", unsafe_allow_html=True)
+
+
+def render_vs_actual_table(merged_df):
+    """Render Prediction vs Actual table with color-coded errors and team dots."""
+    rows_html = ""
+    for _, row in merged_df.iterrows():
+        err = row.get("Error", 0)
+        err_val = float(err) if pd.notna(err) else 0
+        color = "#09ab3b" if abs(err_val) <= 2 else "#ffd600" if abs(err_val) <= 5 else "#e10600"
+        arrow = "▲" if err_val < 0 else "▼" if err_val > 0 else "●"
+        team = str(row.get("Team", ""))
+        dot_color = TEAM_COLORS.get(team, "#888")
+        actual_pos = row.get("ActualPosition")
+        actual_str = f"P{int(actual_pos)}" if pd.notna(actual_pos) else "–"
+        rows_html += f"""
+        <tr style='border-bottom:1px solid #222;'>
+            <td style='padding:8px 12px; color:#fff;'>P{int(row["PredictedRank"])}</td>
+            <td style='padding:8px 4px;'>
+                <span style='display:inline-block;width:10px;height:10px;border-radius:50%;
+                             background:{dot_color};margin-right:8px;'></span>
+                {row.get("Driver","")}
+            </td>
+            <td style='padding:8px 12px; color:#aaa;'>{team}</td>
+            <td style='padding:8px 12px; color:#fff;'>{actual_str}</td>
+            <td style='padding:8px 12px; color:{color}; font-weight:bold;'>
+                {arrow} {abs(err_val):.0f}
+            </td>
+        </tr>"""
+    st.markdown(f"""
+    <table style='width:100%;border-collapse:collapse;background:#111;border-radius:8px;
+                  overflow:hidden;font-family:Arial,sans-serif;'>
+        <thead>
+            <tr style='background:#1a1a1a;'>
+                <th style='padding:10px 12px;color:#e10600;text-align:left;font-size:0.8rem;
+                           text-transform:uppercase;letter-spacing:1px;'>PRED</th>
+                <th style='padding:10px 12px;color:#e10600;text-align:left;font-size:0.8rem;
+                           text-transform:uppercase;letter-spacing:1px;'>DRIVER</th>
+                <th style='padding:10px 12px;color:#e10600;text-align:left;font-size:0.8rem;
+                           text-transform:uppercase;letter-spacing:1px;'>TEAM</th>
+                <th style='padding:10px 12px;color:#e10600;text-align:left;font-size:0.8rem;
+                           text-transform:uppercase;letter-spacing:1px;'>ACTUAL</th>
+                <th style='padding:10px 12px;color:#e10600;text-align:left;font-size:0.8rem;
+                           text-transform:uppercase;letter-spacing:1px;'>DIFF</th>
+            </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+    </table>""", unsafe_allow_html=True)
+
+
 @st.cache_data(ttl=600)
 def load_drivers_and_schedule(year: int):
     used_2025_fallback = False
@@ -157,19 +264,94 @@ def main():
     st.set_page_config(page_title="F1 Race Predictor", page_icon="🏎️", layout="wide")
     init_session_state()
 
-    st.title("F1 Race Prediction Dashboard")
-    st.markdown(
-        "**Qualifying** prediction (1–22) can be used as the **race** starting grid. "
-        "2025 fallback is automatic when 2026 data is missing."
-    )
+    st.markdown("""
+<style>
+/* Dark F1-style theme */
+[data-testid="stAppViewContainer"] { background-color: #0e0e0e; }
+[data-testid="stSidebar"] { background-color: #1a1a1a; border-right: 2px solid #e10600; }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] label { color: #ffffff !important; }
+
+/* Titles */
+h1 { color: #e10600 !important; font-family: 'Formula1', 'Arial Black', sans-serif !important;
+     letter-spacing: 2px; text-transform: uppercase; }
+h2, h3 { color: #ffffff !important; font-family: Arial, sans-serif; }
+
+/* Tabs */
+[data-baseweb="tab"] { color: #aaaaaa !important; font-weight: bold;
+                        text-transform: uppercase; letter-spacing: 1px; }
+[aria-selected="true"] { color: #e10600 !important;
+                          border-bottom: 3px solid #e10600 !important; }
+
+/* Buttons */
+[data-testid="baseButton-primary"], .stButton > button {
+    background-color: #e10600 !important; color: white !important;
+    border: none !important; border-radius: 4px !important;
+    font-weight: bold !important; text-transform: uppercase !important;
+    letter-spacing: 1px !important; padding: 0.5rem 1.5rem !important; }
+.stButton > button:hover { background-color: #ff2a1f !important; }
+
+/* DataFrames */
+[data-testid="stDataFrame"] { border: 1px solid #333 !important; border-radius: 6px; }
+thead tr th { background-color: #1a1a1a !important; color: #e10600 !important;
+              font-weight: bold !important; text-transform: uppercase !important; }
+tbody tr:nth-child(even) { background-color: #161616 !important; }
+tbody tr:hover { background-color: #252525 !important; }
+
+/* Metric cards */
+[data-testid="metric-container"] { background-color: #1a1a1a; border-left: 4px solid #e10600;
+    border-radius: 6px; padding: 1rem; }
+[data-testid="stMetricValue"] { color: #ffffff !important; font-size: 2rem !important; }
+[data-testid="stMetricLabel"] { color: #aaaaaa !important; text-transform: uppercase !important;
+    letter-spacing: 1px !important; }
+
+/* Info / warning boxes */
+[data-testid="stAlert"] { border-radius: 6px !important; }
+.stInfo { border-left: 4px solid #0068c9 !important; background-color: #0a1a2e !important; }
+.stSuccess { border-left: 4px solid #09ab3b !important; background-color: #061a0e !important; }
+.stWarning { border-left: 4px solid #ffd600 !important; background-color: #1a1600 !important; }
+
+/* Selectbox & radio */
+[data-baseweb="select"] { background-color: #1a1a1a !important; }
+[data-testid="stRadio"] label { color: #ffffff !important; }
+
+/* Expander */
+[data-testid="stExpander"] { background-color: #1a1a1a !important;
+    border: 1px solid #333 !important; border-radius: 6px !important; }
+summary { color: #e10600 !important; font-weight: bold !important; }
+
+/* Spinner */
+[data-testid="stSpinner"] > div { border-top-color: #e10600 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+    st.markdown("""
+<div style='display:flex; align-items:center; gap:16px; margin-bottom:8px;'>
+    <span style='font-size:2.8rem;'>🏎️</span>
+    <div>
+        <h1 style='margin:0; font-size:2rem;'>F1 RACE PREDICTOR</h1>
+        <p style='color:#888; margin:0; font-size:0.9rem; letter-spacing:2px;'>
+            POWERED BY XGBOOST + FASTF1 · 2026 SEASON
+        </p>
+    </div>
+</div>
+<hr style='border-color:#e10600; margin-bottom:1.5rem;'>
+""", unsafe_allow_html=True)
 
     enable_fastf1_cache()
 
     with st.sidebar:
-        st.header("Configuration")
-        year = st.number_input("Season year", min_value=2020, max_value=2030, value=2026, step=1)
-        weather_options = ["Dry", "Wet", "Rain"]
-        weather_str = st.radio("Weather", options=weather_options, index=0)
+        st.markdown("## ⚙️ CONFIG")
+        st.markdown("---")
+        year = st.number_input("📅 Season", min_value=2020, max_value=2030, value=2026, step=1)
+        st.markdown("**🌦️ Weather condition**")
+        weather_str = st.radio("", options=["☀️ Dry", "🌧️ Wet", "⛈️ Rain"], index=0, label_visibility="collapsed")
+        weather_str = weather_str.split()[-1]  # strip emoji
+        st.markdown("---")
+        st.markdown("""
+<div style='color:#888; font-size:0.75rem; text-align:center; margin-top:1rem;'>
+F1 data via FastF1 API<br>Model: XGBoost · MAE ~6 pos
+</div>""", unsafe_allow_html=True)
 
     drivers_df, schedule_df, used_2025_fallback = load_drivers_and_schedule(year)
     if drivers_df.empty:
@@ -187,13 +369,46 @@ def main():
         event_name = "Australian Grand Prix"
         round_number = 1
     else:
-        event_labels = [
-            f"Round {int(r['RoundNumber'])} — {r['EventName']} ({r['EventDate']})"
-            for _, r in schedule_df.iterrows()
-        ]
+        today = dt.date.today()
+        event_labels = []
+        for _, r in schedule_df.iterrows():
+            date_val = r["EventDate"]
+            if not isinstance(date_val, dt.date):
+                date_val = pd.to_datetime(date_val).date()
+            days_away = (date_val - today).days
+            status = " ✅" if date_val < today else " 🔜" if days_away <= 7 else ""
+            event_labels.append(
+                f"Round {int(r['RoundNumber'])} — {r['EventName']} ({r['EventDate']}){status}"
+            )
         selected = st.selectbox("Select race", event_labels, index=0)
         round_number = int(selected.split()[1])
         event_name = schedule_df.loc[schedule_df["RoundNumber"] == round_number, "EventName"].iloc[0]
+        event_row = schedule_df[schedule_df["RoundNumber"].astype(int) == round_number].iloc[0]
+        event_date = event_row["EventDate"]
+        event_date_d = event_date if isinstance(event_date, dt.date) else pd.to_datetime(event_date).date()
+        today_card = dt.date.today()
+        is_past = event_date_d < today_card
+        status_badge = (
+            "<span style='background:#09ab3b;color:white;padding:2px 8px;border-radius:10px;"
+            "font-size:0.75rem;font-weight:bold;'>COMPLETED</span>"
+            if is_past else
+            "<span style='background:#e10600;color:white;padding:2px 8px;border-radius:10px;"
+            "font-size:0.75rem;font-weight:bold;'>UPCOMING</span>"
+        )
+        st.markdown(f"""
+<div style='background:#1a1a1a; border:1px solid #333; border-radius:8px;
+            padding:1rem; margin:0.5rem 0;'>
+    <div style='display:flex; justify-content:space-between; align-items:center;'>
+        <div>
+            <div style='color:#e10600; font-weight:bold; font-size:1.1rem;'>
+                {event_name}
+            </div>
+            <div style='color:#888; font-size:0.85rem;'>Round {round_number} · {event_date}</div>
+        </div>
+        {status_badge}
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
     # Track map (circuit-specific when in cache)
     track_data = get_circuit_track_data(event_name)
@@ -232,7 +447,9 @@ def main():
             if quali_df is not None and not quali_df.empty:
                 st.session_state.predicted_quali_grid = quali_to_grid_df(quali_df, drivers_df)
                 st.session_state.race_result_from_quali = None  # reset when new quali run
-                st.dataframe(quali_df, use_container_width=True, hide_index=True)
+                quali_show = quali_df.copy()
+                quali_show["PredictedRank"] = quali_show["PredictedQualiPos"]
+                render_prediction_table(quali_show)
                 _quali_export_df = quali_df[["PredictedQualiPos", "Driver", "Team"]].copy()
                 _quali_export_df.columns = ["Position", "Driver", "Team"]
                 st.download_button(
@@ -256,8 +473,11 @@ def main():
         else:
             if st.session_state.predicted_quali_grid is not None:
                 _pq = st.session_state.predicted_quali_grid
-                _disp = _pq[["PredictedQualiPos", "Driver", "Team"]].rename(columns={"PredictedQualiPos": "P"}) if "PredictedQualiPos" in _pq.columns else _pq
-                st.dataframe(_disp, use_container_width=True, hide_index=True)
+                _pq_show = _pq.copy()
+                _pq_show["PredictedRank"] = _pq_show["PredictedQualiPos"] if "PredictedQualiPos" in _pq.columns else _pq_show["GridPosition"]
+                _pq_show["Driver"] = _pq_show.get("DriverName", _pq_show.get("Driver", ""))
+                _pq_show["Team"] = _pq_show.get("TeamName", _pq_show.get("Team", ""))
+                render_prediction_table(_pq_show)
                 _export_q = _pq[["PredictedQualiPos", "Driver", "Team"]].copy() if "PredictedQualiPos" in _pq.columns else _pq.copy()
                 _export_q.columns = ["Position", "Driver", "Team"]
                 st.download_button("Download qualifying (CSV)", data=_export_q.to_csv(index=False), file_name=f"quali_grid_{event_name.replace(' ', '_')}_R{round_number}.csv", mime="text/csv", key="dl_quali_cached")
@@ -282,7 +502,7 @@ def main():
                     pred_from_quali, _ = st.session_state.race_result_from_quali
                     if not pred_from_quali.empty:
                         st.subheader("Race prediction (from qualifying grid)")
-                        st.dataframe(pred_from_quali, use_container_width=True, hide_index=True)
+                        render_prediction_table(pred_from_quali)
                         st.download_button(
                             "Download race prediction (CSV)",
                             data=pred_from_quali.to_csv(index=False),
@@ -344,12 +564,19 @@ def main():
                 )
             pred_df = result[0] if isinstance(result, tuple) else result
             debug_info = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            model_source = result[2] if isinstance(result, tuple) and len(result) > 2 else "xgboost"
 
             if pred_df.empty:
                 st.warning("No prediction produced.")
             else:
+                if model_source == "xgboost":
+                    st.success("🤖 XGBoost model")
+                elif model_source == "heuristic_build":
+                    st.warning("⚠️ Heuristic fallback (build_prediction)")
+                else:
+                    st.warning("⚠️ Heuristic fallback (form only)")
                 st.subheader("Predicted finishing order")
-                st.dataframe(pred_df, use_container_width=True, hide_index=True)
+                render_prediction_table(pred_df, grid_df)
                 st.download_button(
                     "Download race prediction (CSV)",
                     data=pred_df.to_csv(index=False),
@@ -359,6 +586,8 @@ def main():
                 )
                 if debug_info:
                     with st.expander("Debug: race weather encoding and features"):
+                        for w in get_inference_warnings():
+                            st.warning(w)
                         st.write("**Selected weather:**", debug_info.get("weather", "—"))
                         st.write("**Weather one-hot:**", debug_info.get("weather_encoded", []))
                         st.write("**Feature names:**", debug_info.get("feature_names", []))
@@ -373,24 +602,49 @@ def main():
                                 st.write("**Feature importances:**", imp)
 
                 pred_df = pred_df.copy()
-                pred_df["Strength"] = (len(pred_df) + 1) - pred_df["PredictedRank"]
-                chart = alt.Chart(pred_df).mark_bar().encode(
-                    x=alt.X("Driver:N", sort="-y"),
-                    y="Strength:Q",
-                    color="Team:N",
-                    tooltip=["Driver", "Team", "PredictedRank"],
-                ).properties(height=350)
-                st.altair_chart(chart, use_container_width=True)
+                fig = go.Figure()
+                for _, row in pred_df.sort_values("PredictedRank").iterrows():
+                    team = str(row.get("Team", ""))
+                    color = TEAM_COLORS.get(team, "#888888")
+                    fig.add_trace(go.Bar(
+                        y=[row["Driver"]],
+                        x=[23 - int(row["PredictedRank"])],
+                        orientation="h",
+                        marker_color=color,
+                        name=team,
+                        showlegend=False,
+                        text=f"P{int(row['PredictedRank'])}",
+                        textposition="inside",
+                        hovertemplate=f"<b>{row['Driver']}</b><br>Predicted: P{int(row['PredictedRank'])}<br>Team: {team}<extra></extra>"
+                    ))
+                fig.update_layout(
+                    paper_bgcolor="#0e0e0e", plot_bgcolor="#111111",
+                    font=dict(color="#ffffff", family="Arial"),
+                    height=500, margin=dict(l=120, r=20, t=40, b=20),
+                    title=dict(text="Predicted Race Order", font=dict(color="#e10600", size=16)),
+                    xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                    yaxis=dict(autorange="reversed", gridcolor="#222"),
+                    bargap=0.3,
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
             today = dt.date.today()
             if "EventDate" in schedule_df.columns:
                 schedule_df["EventDate"] = pd.to_datetime(schedule_df["EventDate"]).dt.date
             event_dates = schedule_df[schedule_df["RoundNumber"] == round_number]["EventDate"] if not schedule_df.empty else pd.Series(dtype=object)
             if not event_dates.empty and event_dates.iloc[0] < today:
+                col_refresh, _ = st.columns([1, 4])
+                with col_refresh:
+                    force_refresh = st.button("🔄 Refresh results", key="refresh_actual")
+                if force_refresh:
+                    st.session_state["actual_refresh_ts"] = dt.datetime.now().timestamp()
+                refresh_ts = st.session_state.get("actual_refresh_ts", 0)
                 try:
                     with st.spinner("Loading actual results..."):
-                        actual = _cached_load_race_results(year, round_number)
+                        actual = _cached_load_race_results(year, round_number, refresh_ts)
                     if not actual.empty:
+                        if "TeamName" in actual.columns:
+                            actual["TeamName"] = actual["TeamName"].map(normalize_team_name)
                         actual = actual.rename(columns={"Position": "ActualPosition"})
                         pred_with_abbrev = pred_df.merge(
                             grid_df[["DriverName", "Abbreviation"]],
@@ -410,15 +664,17 @@ def main():
                                 with st.spinner("Computing rolling MAE..."):
                                     _maes, _mean = compute_rolling_mae(year, round_number, schedule_df, weather_str, last_n=5)
                                 if _maes:
-                                    st.metric("Rolling MAE (last 5 races)", f"{_mean:.2f} positions")
-                                    st.caption(f"Rounds: {[r for r, _ in _maes]}")
+                                    mae_df = pd.DataFrame({"Round": [r for r, _ in _maes], "MAE": [m for _, m in _maes]})
+                                    chart = alt.Chart(mae_df).mark_line(point=True).encode(
+                                        x=alt.X("Round:O", title="Round"),
+                                        y=alt.Y("MAE:Q", title="MAE (positions)", scale=alt.Scale(zero=False)),
+                                        tooltip=["Round", alt.Tooltip("MAE:Q", format=".2f")],
+                                    ).properties(title=f"Prediction accuracy — last {len(_maes)} races", height=200)
+                                    st.altair_chart(chart, use_container_width=True)
+                                    st.caption(f"Mean MAE over last {len(_maes)} races: {_mean:.2f} positions")
                                 else:
                                     st.caption("No past rounds to compute.")
-                        st.dataframe(
-                            merged[["PredictedRank", "Driver", "Team", "ActualPosition", "Error"]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+                        render_vs_actual_table(merged)
                         st.download_button(
                             "Download prediction vs actual (CSV)",
                             data=merged[["PredictedRank", "Driver", "Team", "ActualPosition", "Error"]].to_csv(index=False),
@@ -427,7 +683,20 @@ def main():
                             key="dl_pred_actual",
                         )
                 except Exception as e:
-                    st.caption(f"Could not load actual results: {e}")
+                    days_since = (today - pd.to_datetime(event_dates.iloc[0]).date()).days if not event_dates.empty else 99
+                    if days_since == 0:
+                        st.info(
+                            "🏁 **Race just finished!** Results are usually available within 30–60 minutes. "
+                            "Try refreshing the page shortly. FastF1 data can take up to 6 hours.",
+                            icon="⏳"
+                        )
+                    elif days_since <= 1:
+                        st.warning(
+                            f"⚠️ Could not fetch results yet (FastF1 data lag). "
+                            f"Try again in a few hours. Error: `{e}`"
+                        )
+                    else:
+                        st.error(f"Could not load actual results: `{e}`")
 
     st.caption(
         "Retrain race model: `python scripts/train_model.py` (trains both race and quali models)."

@@ -57,10 +57,69 @@ def load_race_weather(year: int, round_number: int) -> Optional[str]:
         return None
 
 
+def fetch_results_from_jolpica(year: int, round_number: int) -> pd.DataFrame:
+    """
+    Fetch race results from the Jolpica API (fast, available ~30 min after race).
+    Returns DataFrame with: Abbreviation, DriverName, TeamName, Position
+    or empty DataFrame on failure.
+
+    API endpoint: https://api.jolpi.ca/ergast/f1/{year}/{round}/results/
+    """
+    import requests
+
+    url = f"https://api.jolpi.ca/ergast/f1/{year}/{round_number}/results/"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+        if not races:
+            return pd.DataFrame()
+        results = races[0].get("Results", [])
+        if not results:
+            return pd.DataFrame()
+        rows = []
+        for r in results:
+            driver = r.get("Driver", {})
+            constructor = r.get("Constructor", {})
+            rows.append({
+                "Position": int(r.get("position", 99)),
+                "Abbreviation": driver.get("code", "UNK").upper(),
+                "DriverName": f"{driver.get('givenName','')} {driver.get('familyName','')}".strip(),
+                "TeamName": constructor.get("name", "Unknown"),
+                "Status": r.get("status", "Finished"),
+            })
+        df = pd.DataFrame(rows)
+        df["Position"] = pd.to_numeric(df["Position"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def load_race_results(year: int, round_number: int) -> pd.DataFrame:
-    """Load race results (finish positions) for a specific event. Empty DataFrame on failure.
-    Includes Status and Laps when available for DNF handling in training.
-    Adds RaceLaps (total race laps) when available for <50% laps imputation."""
+    """
+    Load race results. For recent races (within 3 days of today),
+    tries Jolpica API first (faster), then falls back to FastF1.
+    """
+    import datetime as dt
+
+    # For very recent races, try Jolpica first (FastF1 has a data lag)
+    try:
+        from config import get_schedule_fallback
+        sched = get_schedule_fallback(year)
+        if not sched.empty:
+            row = sched[sched["RoundNumber"] == round_number]
+            if not row.empty:
+                event_date = pd.to_datetime(row.iloc[0]["EventDate"]).date()
+                days_since = (dt.date.today() - event_date).days
+                if 0 <= days_since <= 3:
+                    jolpica_df = fetch_results_from_jolpica(year, round_number)
+                    if not jolpica_df.empty:
+                        return jolpica_df
+    except Exception:
+        pass
+
+    # Original FastF1 logic
     try:
         session = fastf1.get_session(year, round_number, "R")
         session.load()
@@ -74,7 +133,6 @@ def load_race_results(year: int, round_number: int) -> pd.DataFrame:
         df["Position"] = pd.to_numeric(df["Position"], errors="coerce")
         if "Laps" in df.columns:
             df["Laps"] = pd.to_numeric(df["Laps"], errors="coerce")
-        # Total race laps for <50% imputation (session.total_laps or max completed)
         total_laps = getattr(session, "total_laps", None)
         if total_laps is None and "Laps" in df.columns:
             total_laps = df["Laps"].max()
@@ -196,6 +254,48 @@ def load_qualifying_results(year: int, round_number: int) -> pd.DataFrame:
         df["Position"] = pd.to_numeric(df["Position"], errors="coerce")
         df = df.rename(columns={"Position": "QualiPosition"})
         return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_quali_gaps(year: int, round_number: int) -> pd.DataFrame:
+    """
+    Load each driver's best qualifying lap gap to pole (seconds).
+    Uses best lap across all Q segments. Returns DataFrame:
+    Year, Round, Abbreviation, quali_gap_to_pole (float seconds).
+    Missing drivers get NaN (to be filled downstream).
+    """
+    try:
+        session = fastf1.get_session(year, round_number, "Q")
+        session.load()
+        laps = session.laps
+        if laps is None or (hasattr(laps, "empty") and laps.empty):
+            return pd.DataFrame()
+        best = laps.dropna(subset=["LapTime"]).groupby("DriverNumber").agg(
+            BestLap=("LapTime", "min")
+        ).reset_index()
+        if best.empty:
+            return pd.DataFrame()
+
+        def _to_sec(t):
+            return t.total_seconds() if hasattr(t, "total_seconds") else float(t)
+
+        best["best_sec"] = best["BestLap"].apply(_to_sec)
+        pole_time = best["best_sec"].min()
+        best["quali_gap_to_pole"] = best["best_sec"] - pole_time
+
+        results = session.results
+        if results is not None and not results.empty and "Abbreviation" in results.columns:
+            best = best.merge(
+                results[["DriverNumber", "Abbreviation"]].drop_duplicates("DriverNumber"),
+                on="DriverNumber",
+                how="left",
+            )
+        else:
+            best["Abbreviation"] = best["DriverNumber"].astype(str)
+        best["Year"] = year
+        best["Round"] = round_number
+        return best[["Year", "Round", "Abbreviation", "quali_gap_to_pole"]]
     except Exception:
         return pd.DataFrame()
 
